@@ -650,7 +650,7 @@ function App() {
     const { data } = await cloud.auth.getUser();
     const user = data.user;
     if (!user) {
-      if (showAlert) setIsAuthModalOpen(true);
+      if (showAlert) openAuthModal();
       return false;
     }
 
@@ -1133,6 +1133,16 @@ function App() {
     importInputRef.current?.click();
   }
 
+  function openAuthModal() {
+    if (!getSupabaseConfig().isConfigured) {
+      setCloudCheckMessage('请先完成云端设置：填写 Supabase URL 和 anon key，执行建表 SQL，再检查连接。');
+      setIsCloudModalOpen(true);
+      return;
+    }
+
+    setIsAuthModalOpen(true);
+  }
+
   async function handleChooseBackupDir() {
     if (!IS_TAURI) {
       alert('只有桌面版才能选择备份目录。');
@@ -1347,7 +1357,7 @@ function App() {
 
     const user = cloudUser ?? (await refreshCloudUser());
     if (!user) {
-      setIsAuthModalOpen(true);
+      openAuthModal();
       return;
     }
 
@@ -1485,7 +1495,7 @@ function App() {
               退出账号
             </button>
           ) : (
-            <button className="secondary-inline" onClick={() => setIsAuthModalOpen(true)}>
+            <button className="secondary-inline" onClick={openAuthModal}>
               登录云端
             </button>
           )}
@@ -2190,6 +2200,7 @@ function App() {
         <div className="modal-overlay" onClick={() => setIsAuthModalOpen(false)}>
           <div className="modal" onClick={(event) => event.stopPropagation()}>
             <h2>登录云端账号</h2>
+            <div className="cloud-check-result">如果还没有配置云端，请先到“云端设置”填写 Supabase 并检查连接。</div>
             <form
               onSubmit={(event) => {
                 event.preventDefault();
