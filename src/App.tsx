@@ -341,6 +341,17 @@ function readSnapshotFromLocalStorage() {
   );
 }
 
+function readPreviousSnapshotFromLocalStorage() {
+  const saved = localStorage.getItem(STORAGE_KEYS.previousSnapshot);
+  if (!saved) return null;
+
+  try {
+    return parseSnapshotPayload(JSON.parse(saved));
+  } catch {
+    return null;
+  }
+}
+
 function buildExcelHtml(snapshot: AppSnapshot) {
   const rows = snapshot.materials
     .map(
@@ -1603,6 +1614,20 @@ function App() {
     }
   }
 
+  async function handleRestorePreviousLocalSnapshot() {
+    const snapshot = readPreviousSnapshotFromLocalStorage();
+    if (!snapshot || snapshot.materials.length === 0) {
+      alert('没有找到可恢复的上次本机快照。请检查另一台电脑、桌面版本地备份或 Supabase 旧备份。');
+      return;
+    }
+
+    if (!confirm(`找到上次本机快照，共 ${snapshot.materials.length} 条物料。确定恢复吗？`)) return;
+
+    await persistSnapshot(snapshot);
+    setSelectedCategory('全部');
+    alert(`已恢复上次本机快照，共 ${snapshot.materials.length} 条物料。`);
+  }
+
   const filteredMaterials = materials.filter((item) => {
     const matchCategory = selectedCategory === '全部' || item.category === selectedCategory;
     const matchQuickFilter =
@@ -1716,6 +1741,9 @@ function App() {
           </button>
           <button className="secondary-inline" onClick={() => void handleRestoreCloudBackup()}>
             从云端恢复
+          </button>
+          <button className="secondary-inline" onClick={() => void handleRestorePreviousLocalSnapshot()}>
+            恢复上次本机快照
           </button>
           {backupDir ? (
             <button className="secondary-inline" onClick={() => void handleResetBackupDir()}>
