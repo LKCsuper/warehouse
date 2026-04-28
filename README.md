@@ -54,6 +54,9 @@ create table if not exists warehouse_backups (
 
 alter table warehouse_backups enable row level security;
 
+-- 启用分类、位置、排序等整份备份的实时订阅
+alter publication supabase_realtime add table warehouse_backups;
+
 create policy "Users can read own backup"
 on warehouse_backups for select
 using (auth.uid() = user_id);

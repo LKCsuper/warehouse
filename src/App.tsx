@@ -67,6 +67,7 @@ const STORAGE_KEYS = {
   supabaseUrl: 'supabase_url',
   supabaseKey: 'supabase_key',
   viewMode: 'view_mode',
+  snapshotSavedAt: 'snapshot_saved_at',
 } as const;
 
 const BACKUP_FOLDER = 'backups';
@@ -82,6 +83,8 @@ const CLOUD_SETUP_SQL = `create table if not exists warehouse_backups (
 );
 
 alter table warehouse_backups enable row level security;
+
+alter publication supabase_realtime add table warehouse_backups;
 
 drop policy if exists "Users can read own backup" on warehouse_backups;
 drop policy if exists "Users can create own backup" on warehouse_backups;
@@ -216,6 +219,28 @@ function createSnapshot(
   };
 }
 
+function isValidDateString(value: unknown): value is string {
+  return typeof value === 'string' && !Number.isNaN(new Date(value).getTime());
+}
+
+function withSnapshotSavedAt(snapshot: AppSnapshot, savedAt: unknown): AppSnapshot {
+  return isValidDateString(savedAt) ? { ...snapshot, saved_at: savedAt } : snapshot;
+}
+
+function getLatestMaterialTime(materials: Material[]) {
+  return materials.reduce((latest, item) => {
+    const updatedAtTime = new Date(item.updated_at).getTime();
+    return Number.isNaN(updatedAtTime) ? latest : Math.max(latest, updatedAtTime);
+  }, 0);
+}
+
+function getSnapshotTime(snapshot: AppSnapshot) {
+  const savedAtTime = new Date(snapshot.saved_at).getTime();
+  if (!Number.isNaN(savedAtTime)) return savedAtTime;
+
+  return getLatestMaterialTime(snapshot.materials);
+}
+
 function reorderItems<T>(items: T[], fromIndex: number, toIndex: number) {
   if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return items;
 
@@ -242,11 +267,31 @@ function applyStoredMaterialOrder(remoteMaterials: Material[], localMaterials: M
   });
 }
 
+function haveSameMaterials(a: Material[], b: Material[]) {
+  if (a.length !== b.length) return false;
+
+  const bById = new Map(b.map((item) => [item.id, item]));
+  return a.every((item) => {
+    const other = bById.get(item.id);
+    return Boolean(other) && JSON.stringify(item) === JSON.stringify(other);
+  });
+}
+
+function isMissingTableError(error: unknown) {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code?: string }).code === '42P01'
+  );
+}
+
 function saveSnapshotToLocalStorage(snapshot: AppSnapshot) {
   localStorage.setItem(STORAGE_KEYS.materials, JSON.stringify(snapshot.materials));
   localStorage.setItem(STORAGE_KEYS.categories, JSON.stringify(snapshot.categories));
   localStorage.setItem(STORAGE_KEYS.locations, JSON.stringify(snapshot.locations));
   localStorage.setItem(STORAGE_KEYS.operationLogs, JSON.stringify(snapshot.operation_logs));
+  localStorage.setItem(STORAGE_KEYS.snapshotSavedAt, snapshot.saved_at);
 }
 
 function readSnapshotFromLocalStorage() {
@@ -264,11 +309,20 @@ function readSnapshotFromLocalStorage() {
     }
   }
 
-  return createSnapshot(
+  const snapshot = createSnapshot(
     materials,
     loadStoredList(STORAGE_KEYS.categories, DEFAULT_CATEGORIES),
     loadStoredList(STORAGE_KEYS.locations, DEFAULT_LOCATIONS),
     loadStoredOperationLogs(),
+  );
+
+  const savedAt = localStorage.getItem(STORAGE_KEYS.snapshotSavedAt);
+  if (savedAt) return withSnapshotSavedAt(snapshot, savedAt);
+
+  const latestMaterialTime = getLatestMaterialTime(materials);
+  return withSnapshotSavedAt(
+    snapshot,
+    latestMaterialTime > 0 ? new Date(latestMaterialTime).toISOString() : new Date(0).toISOString(),
   );
 }
 
@@ -639,6 +693,143 @@ function App() {
     low_stock_threshold: 5,
     location: '',
   });
+  const realtimeChannelRef = useRef<ReturnType<SupabaseClient['channel']> | null>(null);
+  const realtimeRefreshTimerRef = useRef<number | null>(null);
+  const cloudPollingTimerRef = useRef<number | null>(null);
+
+  async function syncLatestCloudState(sourceLabel = '云端') {
+    const cloud = initSupabase();
+    if (!cloud) {
+      setIsOnline(false);
+      return false;
+    }
+
+    const localSnapshot = readSnapshotFromLocalStorage();
+    const { data: userData } = await cloud.auth.getUser();
+    const user = userData.user;
+
+    if (user) {
+      const { data: backupData, error: backupError } = await cloud
+        .from('warehouse_backups')
+        .select('snapshot, updated_at')
+        .eq('id', user.id)
+        .maybeSingle();
+
+      if (backupError) throw backupError;
+
+      const cloudSnapshot = parseSnapshotPayload(backupData?.snapshot);
+      const cloudSavedAt = backupData?.updated_at ?? cloudSnapshot?.saved_at;
+      const cloudSnapshotWithTime = cloudSnapshot ? withSnapshotSavedAt(cloudSnapshot, cloudSavedAt) : null;
+
+      if (cloudSnapshotWithTime && getSnapshotTime(cloudSnapshotWithTime) > getSnapshotTime(localSnapshot)) {
+        await persistSnapshot(cloudSnapshotWithTime);
+        const message = `已自动同步${sourceLabel}：${new Date(cloudSnapshotWithTime.saved_at).toLocaleString()}`;
+        setBackupMessage(message);
+        setCloudMessage(message);
+        setIsOnline(true);
+        return true;
+      }
+    }
+
+    const { data, error } = await cloud
+      .from('materials')
+      .select('*')
+      .order('updated_at', { ascending: false });
+
+    if (error) {
+      if (isMissingTableError(error)) {
+        setIsOnline(true);
+        return false;
+      }
+      throw error;
+    }
+    if (!data) return false;
+
+    const orderedMaterials = applyStoredMaterialOrder(
+      data.map((item, index) => normalizeMaterial(item, index)),
+      localSnapshot.materials,
+    );
+
+    if (haveSameMaterials(orderedMaterials, localSnapshot.materials)) {
+      setIsOnline(true);
+      return false;
+    }
+
+    await persistSnapshot(
+      createSnapshot(orderedMaterials, localSnapshot.categories, localSnapshot.locations, localSnapshot.operation_logs),
+    );
+    setCloudMessage(`已自动同步${sourceLabel}物料：${new Date().toLocaleString()}`);
+    setIsOnline(true);
+    return true;
+  }
+
+  function scheduleCloudRefresh(sourceLabel = '云端') {
+    if (realtimeRefreshTimerRef.current !== null) {
+      window.clearTimeout(realtimeRefreshTimerRef.current);
+    }
+
+    realtimeRefreshTimerRef.current = window.setTimeout(() => {
+      realtimeRefreshTimerRef.current = null;
+      void syncLatestCloudState(sourceLabel).catch((error) => {
+        console.error('实时同步云端数据失败:', error);
+        setIsOnline(false);
+        setCloudMessage('实时同步失败，请检查网络或 Supabase Realtime 配置');
+      });
+    }, 300);
+  }
+
+  function stopRealtimeSync() {
+    if (realtimeRefreshTimerRef.current !== null) {
+      window.clearTimeout(realtimeRefreshTimerRef.current);
+      realtimeRefreshTimerRef.current = null;
+    }
+    if (cloudPollingTimerRef.current !== null) {
+      window.clearInterval(cloudPollingTimerRef.current);
+      cloudPollingTimerRef.current = null;
+    }
+
+    const cloud = initSupabase();
+    if (cloud && realtimeChannelRef.current) {
+      void cloud.removeChannel(realtimeChannelRef.current);
+    }
+    realtimeChannelRef.current = null;
+  }
+
+  function startRealtimeSync(userId?: string) {
+    const cloud = initSupabase();
+    if (!cloud) return;
+
+    stopRealtimeSync();
+
+    const channel = cloud
+      .channel(`warehouse-sync-${userId ?? 'public'}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'materials' }, () => {
+        scheduleCloudRefresh('其他设备');
+      });
+
+    if (userId) {
+      channel.on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'warehouse_backups', filter: `user_id=eq.${userId}` },
+        () => {
+          scheduleCloudRefresh('其他设备');
+        },
+      );
+    }
+
+    realtimeChannelRef.current = channel;
+    void channel.subscribe((status) => {
+      if (status === 'SUBSCRIBED') {
+        setIsOnline(true);
+      }
+    });
+
+    cloudPollingTimerRef.current = window.setInterval(() => {
+      void syncLatestCloudState('云端').catch((error) => {
+        console.error('定时同步云端数据失败:', error);
+      });
+    }, 10000);
+  }
 
   async function uploadCloudSnapshot(snapshot: AppSnapshot, showAlert = false) {
     const cloud = initSupabase();
@@ -722,15 +913,24 @@ function App() {
 
   useEffect(() => {
     void loadMaterials();
-    void refreshCloudUser();
+    void refreshCloudUser().then((user) => {
+      if (user) startRealtimeSync(user.id);
+    });
 
     const cloud = initSupabase();
     const subscription = cloud?.auth.onAuthStateChange((_event, session) => {
       setCloudUser(session?.user ?? null);
       setCloudMessage(session?.user?.email ? `已登录：${session.user.email}` : '云端备份已配置，请登录后同步');
+      if (session?.user) {
+        startRealtimeSync(session.user.id);
+        scheduleCloudRefresh('云端');
+      } else {
+        stopRealtimeSync();
+      }
     });
 
     return () => {
+      stopRealtimeSync();
       subscription?.data.subscription.unsubscribe();
     };
   }, []);
@@ -775,23 +975,7 @@ function App() {
         return;
       }
 
-      const { data, error } = await cloud
-        .from('materials')
-        .select('*')
-        .order('updated_at', { ascending: false });
-
-      if (error) throw error;
-      if (data && data.length > 0) {
-        const orderedMaterials = applyStoredMaterialOrder(
-          data.map((item, index) => normalizeMaterial(item, index)),
-          localSnapshot.materials,
-        );
-
-        await persistSnapshot(
-          createSnapshot(orderedMaterials, localSnapshot.categories, localSnapshot.locations),
-        );
-        setIsOnline(true);
-      }
+      await syncLatestCloudState('云端');
     } catch (error) {
       console.error('加载数据失败:', error);
       setIsOnline(false);
