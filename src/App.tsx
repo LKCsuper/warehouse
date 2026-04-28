@@ -68,6 +68,7 @@ const STORAGE_KEYS = {
   supabaseKey: 'supabase_key',
   viewMode: 'view_mode',
   snapshotSavedAt: 'snapshot_saved_at',
+  previousSnapshot: 'previous_snapshot',
 } as const;
 
 const BACKUP_FOLDER = 'backups';
@@ -292,6 +293,20 @@ function saveSnapshotToLocalStorage(snapshot: AppSnapshot) {
   localStorage.setItem(STORAGE_KEYS.locations, JSON.stringify(snapshot.locations));
   localStorage.setItem(STORAGE_KEYS.operationLogs, JSON.stringify(snapshot.operation_logs));
   localStorage.setItem(STORAGE_KEYS.snapshotSavedAt, snapshot.saved_at);
+}
+
+function savePreviousSnapshotIfNeeded(nextSnapshot: AppSnapshot) {
+  const previousSnapshot = readSnapshotFromLocalStorage();
+  const materialsChanged = !haveSameMaterials(previousSnapshot.materials, nextSnapshot.materials);
+  const categoriesChanged = JSON.stringify(previousSnapshot.categories) !== JSON.stringify(nextSnapshot.categories);
+  const locationsChanged = JSON.stringify(previousSnapshot.locations) !== JSON.stringify(nextSnapshot.locations);
+
+  if (
+    previousSnapshot.materials.length > 0 &&
+    (materialsChanged || categoriesChanged || locationsChanged)
+  ) {
+    localStorage.setItem(STORAGE_KEYS.previousSnapshot, JSON.stringify(previousSnapshot));
+  }
 }
 
 function readSnapshotFromLocalStorage() {
@@ -722,6 +737,12 @@ function App() {
       const cloudSnapshotWithTime = cloudSnapshot ? withSnapshotSavedAt(cloudSnapshot, cloudSavedAt) : null;
 
       if (cloudSnapshotWithTime && getSnapshotTime(cloudSnapshotWithTime) > getSnapshotTime(localSnapshot)) {
+        if (cloudSnapshotWithTime.materials.length === 0 && localSnapshot.materials.length > 0) {
+          setIsOnline(true);
+          setCloudMessage('云端备份为空，已保留本机物料，未自动覆盖');
+          return false;
+        }
+
         await persistSnapshot(cloudSnapshotWithTime);
         const message = `已自动同步${sourceLabel}：${new Date(cloudSnapshotWithTime.saved_at).toLocaleString()}`;
         setBackupMessage(message);
@@ -749,6 +770,12 @@ function App() {
       data.map((item, index) => normalizeMaterial(item, index)),
       localSnapshot.materials,
     );
+
+    if (orderedMaterials.length === 0 && localSnapshot.materials.length > 0) {
+      setIsOnline(true);
+      setCloudMessage('云端物料为空，已保留本机物料，未自动覆盖');
+      return false;
+    }
 
     if (haveSameMaterials(orderedMaterials, localSnapshot.materials)) {
       setIsOnline(true);
@@ -861,6 +888,7 @@ function App() {
   }
 
   async function persistSnapshot(snapshot: AppSnapshot, syncState = true) {
+    savePreviousSnapshotIfNeeded(snapshot);
     saveSnapshotToLocalStorage(snapshot);
 
     if (syncState) {
