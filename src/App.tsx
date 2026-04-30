@@ -1857,9 +1857,6 @@ function App() {
   const missingImageCount = materials.filter((item) => !item.photo_url).length;
   const missingDatasheetCount = materials.filter((item) => !item.datasheet_url).length;
   const missingPurchaseCount = materials.filter((item) => !item.purchase_url).length;
-  const incompleteMaterialCount = materials.filter(
-    (item) => !item.photo_url || !item.datasheet_url || !item.purchase_url || !item.location,
-  ).length;
   const usedLocationCount = new Set(materials.map((item) => item.location).filter(Boolean)).size;
   const detailMaterial = detailMaterialId ? materials.find((item) => item.id === detailMaterialId) ?? null : null;
   const detailLogs = detailMaterial
@@ -1922,41 +1919,6 @@ function App() {
           <strong>{usedLocationCount}</strong>
           <small>共维护 {locations.length} 个位置</small>
         </div>
-      </section>
-
-      <section className="health-strip" aria-label="资料完整度">
-        <div className="health-summary">
-          <span>资料完整度</span>
-          <strong>{materials.length > 0 ? `${materials.length - incompleteMaterialCount}/${materials.length}` : '0/0'}</strong>
-        </div>
-        <button
-          type="button"
-          className={quickFilter === 'missing-image' ? 'active' : ''}
-          onClick={() => setQuickFilter('missing-image')}
-        >
-          无图 <strong>{missingImageCount}</strong>
-        </button>
-        <button
-          type="button"
-          className={quickFilter === 'missing-datasheet' ? 'active' : ''}
-          onClick={() => setQuickFilter('missing-datasheet')}
-        >
-          无规格书 <strong>{missingDatasheetCount}</strong>
-        </button>
-        <button
-          type="button"
-          className={quickFilter === 'missing-purchase' ? 'active' : ''}
-          onClick={() => setQuickFilter('missing-purchase')}
-        >
-          无购买链接 <strong>{missingPurchaseCount}</strong>
-        </button>
-        <button
-          type="button"
-          className={quickFilter === 'unset-location' ? 'active' : ''}
-          onClick={() => setQuickFilter('unset-location')}
-        >
-          未设位置 <strong>{unsetLocationCount}</strong>
-        </button>
       </section>
 
       <div className="backup-banner">

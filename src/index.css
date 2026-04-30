@@ -371,61 +371,6 @@ textarea::placeholder {
   background: linear-gradient(180deg, #ffffff, #fff8ed);
 }
 
-.health-strip {
-  display: grid;
-  grid-template-columns: minmax(170px, 0.8fr) repeat(4, minmax(120px, 1fr));
-  gap: 0.55rem;
-  align-items: stretch;
-  padding: 0.72rem;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--surface);
-  box-shadow: 0 8px 24px rgba(16, 24, 40, 0.045);
-}
-
-.health-summary,
-.health-strip button {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.7rem;
-  min-height: 38px;
-  padding: 0.45rem 0.65rem;
-  border-radius: var(--radius);
-}
-
-.health-summary {
-  border: 1px solid rgba(37, 99, 235, 0.18);
-  background: var(--primary-soft);
-  color: var(--primary);
-}
-
-.health-summary span,
-.health-strip button {
-  font-size: var(--font-small);
-  font-weight: 720;
-}
-
-.health-summary strong,
-.health-strip button strong {
-  flex: 0 0 auto;
-  font-size: 0.95rem;
-}
-
-.health-strip button {
-  border: 1px solid var(--border);
-  background: var(--surface-muted);
-  color: var(--text-soft);
-}
-
-.health-strip button:hover,
-.health-strip button.active {
-  border-color: rgba(37, 99, 235, 0.32);
-  background: var(--primary-soft);
-  color: var(--primary);
-}
-
 .backup-banner,
 .sidebar,
 .content,
@@ -1870,10 +1815,6 @@ button,
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .health-strip {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
   .sidebar {
     position: static;
   }
@@ -1941,7 +1882,6 @@ button,
   }
 
   .overview-grid,
-  .health-strip,
   .form-row {
     grid-template-columns: 1fr;
   }
