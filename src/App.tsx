@@ -2522,7 +2522,7 @@ function App() {
       ) : null}
 
       {isModalOpen ? (
-        <div className="modal-overlay" onClick={() => setIsModalOpen(false)}>
+        <div className="modal-overlay">
           <div className="modal" onClick={(event) => event.stopPropagation()}>
             <h2>{editingMaterial ? '编辑物料' : '添加物料'}</h2>
             <form onSubmit={handleSubmit}>
