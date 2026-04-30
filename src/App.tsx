@@ -28,6 +28,8 @@ interface Material {
   supplier: string;
   purchase_url: string;
   datasheet_url: string;
+  photo_url: string;
+  project: string;
   description: string;
   quantity: number;
   low_stock_threshold: number;
@@ -51,6 +53,7 @@ interface AppSnapshot {
   materials: Material[];
   categories: string[];
   locations: string[];
+  projects: string[];
   operation_logs: OperationLog[];
 }
 
@@ -62,11 +65,13 @@ const STORAGE_KEYS = {
   materials: 'materials',
   categories: 'categories',
   locations: 'locations',
+  projects: 'projects',
   operationLogs: 'operation_logs',
   backupDir: 'backup_dir',
   supabaseUrl: 'supabase_url',
   supabaseKey: 'supabase_key',
   viewMode: 'view_mode',
+  theme: 'theme',
   snapshotSavedAt: 'snapshot_saved_at',
   previousSnapshot: 'previous_snapshot',
 } as const;
@@ -74,6 +79,7 @@ const STORAGE_KEYS = {
 const BACKUP_FOLDER = 'backups';
 const BACKUP_JSON_FILE = 'warehouse-backup.json';
 const BACKUP_XLS_FILE = 'warehouse-backup.xls';
+const MATERIAL_IMAGE_BUCKET = 'warehouse-material-images';
 const ENV_SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL?.trim() || '';
 const ENV_SUPABASE_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY?.trim() || '';
 const CLOUD_SETUP_SQL = `create table if not exists warehouse_backups (
@@ -102,10 +108,46 @@ with check (auth.uid() = user_id and auth.uid() = id);
 create policy "Users can update own backup"
 on warehouse_backups for update
 using (auth.uid() = user_id)
-with check (auth.uid() = user_id and auth.uid() = id);`;
+with check (auth.uid() = user_id and auth.uid() = id);
+
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values (
+  'warehouse-material-images',
+  'warehouse-material-images',
+  true,
+  5242880,
+  array['image/jpeg', 'image/png', 'image/webp', 'image/gif']
+)
+on conflict (id) do update
+set public = true,
+    file_size_limit = 5242880,
+    allowed_mime_types = array['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+
+drop policy if exists "Anyone can read material images" on storage.objects;
+drop policy if exists "Users can upload own material images" on storage.objects;
+drop policy if exists "Users can update own material images" on storage.objects;
+drop policy if exists "Users can delete own material images" on storage.objects;
+
+create policy "Anyone can read material images"
+on storage.objects for select
+using (bucket_id = 'warehouse-material-images');
+
+create policy "Users can upload own material images"
+on storage.objects for insert
+with check (bucket_id = 'warehouse-material-images' and auth.uid()::text = (storage.foldername(name))[1]);
+
+create policy "Users can update own material images"
+on storage.objects for update
+using (bucket_id = 'warehouse-material-images' and auth.uid()::text = (storage.foldername(name))[1])
+with check (bucket_id = 'warehouse-material-images' and auth.uid()::text = (storage.foldername(name))[1]);
+
+create policy "Users can delete own material images"
+on storage.objects for delete
+using (bucket_id = 'warehouse-material-images' and auth.uid()::text = (storage.foldername(name))[1]);`;
 
 const DEFAULT_CATEGORIES = ['电阻', '电容', '电感', '二极管', '三极管', '芯片', '传感器', '连接器', '晶振', '其他'];
 const DEFAULT_LOCATIONS = ['抽屉 A-1', '抽屉 A-2', '抽屉 B-1', '抽屉 B-2', '盒子 C-1', '盒子 C-2', '架子 D', '其他'];
+const DEFAULT_PROJECTS: string[] = [];
 
 let supabase: SupabaseClient | null = null;
 let supabaseClientKey = '';
@@ -189,6 +231,8 @@ function normalizeMaterial(value: Partial<Material>, index = 0): Material {
     supplier: typeof value.supplier === 'string' ? value.supplier : '',
     purchase_url: typeof value.purchase_url === 'string' ? value.purchase_url : '',
     datasheet_url: typeof value.datasheet_url === 'string' ? value.datasheet_url : '',
+    photo_url: typeof value.photo_url === 'string' ? value.photo_url : '',
+    project: typeof value.project === 'string' ? value.project : '',
     description: typeof value.description === 'string' ? value.description : '',
     quantity:
       typeof value.quantity === 'number'
@@ -197,7 +241,7 @@ function normalizeMaterial(value: Partial<Material>, index = 0): Material {
     low_stock_threshold:
       typeof value.low_stock_threshold === 'number'
         ? Math.max(0, value.low_stock_threshold)
-        : Math.max(0, Number.parseInt(String(value.low_stock_threshold ?? 5), 10) || 5),
+        : Math.max(0, Number.parseInt(String(value.low_stock_threshold ?? 0), 10) || 0),
     location: typeof value.location === 'string' ? value.location : '',
     created_at: typeof value.created_at === 'string' ? value.created_at : now,
     updated_at: typeof value.updated_at === 'string' ? value.updated_at : now,
@@ -209,13 +253,18 @@ function createSnapshot(
   categories: string[],
   locations: string[],
   operationLogs = loadStoredOperationLogs(),
+  projects = loadStoredList(STORAGE_KEYS.projects, DEFAULT_PROJECTS),
 ): AppSnapshot {
+  const normalizedMaterials = materials.map((item, index) => normalizeMaterial(item, index));
+  const materialProjects = normalizedMaterials.map((item) => item.project).filter(Boolean);
+
   return {
     version: 1,
     saved_at: new Date().toISOString(),
-    materials: materials.map((item, index) => normalizeMaterial(item, index)),
+    materials: normalizedMaterials,
     categories,
     locations,
+    projects: Array.from(new Set([...projects, ...materialProjects])),
     operation_logs: operationLogs.slice(0, 80),
   };
 }
@@ -291,6 +340,7 @@ function saveSnapshotToLocalStorage(snapshot: AppSnapshot) {
   localStorage.setItem(STORAGE_KEYS.materials, JSON.stringify(snapshot.materials));
   localStorage.setItem(STORAGE_KEYS.categories, JSON.stringify(snapshot.categories));
   localStorage.setItem(STORAGE_KEYS.locations, JSON.stringify(snapshot.locations));
+  localStorage.setItem(STORAGE_KEYS.projects, JSON.stringify(snapshot.projects));
   localStorage.setItem(STORAGE_KEYS.operationLogs, JSON.stringify(snapshot.operation_logs));
   localStorage.setItem(STORAGE_KEYS.snapshotSavedAt, snapshot.saved_at);
 }
@@ -300,10 +350,11 @@ function savePreviousSnapshotIfNeeded(nextSnapshot: AppSnapshot) {
   const materialsChanged = !haveSameMaterials(previousSnapshot.materials, nextSnapshot.materials);
   const categoriesChanged = JSON.stringify(previousSnapshot.categories) !== JSON.stringify(nextSnapshot.categories);
   const locationsChanged = JSON.stringify(previousSnapshot.locations) !== JSON.stringify(nextSnapshot.locations);
+  const projectsChanged = JSON.stringify(previousSnapshot.projects) !== JSON.stringify(nextSnapshot.projects);
 
   if (
     previousSnapshot.materials.length > 0 &&
-    (materialsChanged || categoriesChanged || locationsChanged)
+    (materialsChanged || categoriesChanged || locationsChanged || projectsChanged)
   ) {
     localStorage.setItem(STORAGE_KEYS.previousSnapshot, JSON.stringify(previousSnapshot));
   }
@@ -329,6 +380,7 @@ function readSnapshotFromLocalStorage() {
     loadStoredList(STORAGE_KEYS.categories, DEFAULT_CATEGORIES),
     loadStoredList(STORAGE_KEYS.locations, DEFAULT_LOCATIONS),
     loadStoredOperationLogs(),
+    loadStoredList(STORAGE_KEYS.projects, DEFAULT_PROJECTS),
   );
 
   const savedAt = localStorage.getItem(STORAGE_KEYS.snapshotSavedAt);
@@ -365,6 +417,8 @@ function buildExcelHtml(snapshot: AppSnapshot) {
           <td>${escapeHtml(item.supplier)}</td>
           <td>${escapeHtml(item.purchase_url)}</td>
           <td>${escapeHtml(item.datasheet_url)}</td>
+          <td>${escapeHtml(item.photo_url)}</td>
+          <td>${escapeHtml(item.project)}</td>
           <td>${item.quantity}</td>
           <td>${item.low_stock_threshold}</td>
           <td>${escapeHtml(item.location)}</td>
@@ -403,6 +457,8 @@ function buildExcelHtml(snapshot: AppSnapshot) {
         <th>供应商</th>
         <th>购买链接</th>
         <th>规格书</th>
+        <th>图片</th>
+        <th>项目</th>
         <th>数量</th>
         <th>预警值</th>
         <th>位置</th>
@@ -464,6 +520,11 @@ function parseSnapshotPayload(payload: unknown): AppSnapshot | null {
       ? record.locations.filter((item): item is string => typeof item === 'string')
       : Array.from(new Set(record.materials.map((item) => item.location || '').filter(Boolean)));
 
+  const projects =
+    Array.isArray(record.projects) && record.projects.length > 0
+      ? record.projects.filter((item): item is string => typeof item === 'string')
+      : Array.from(new Set(record.materials.map((item) => item.project || '').filter(Boolean)));
+
   return createSnapshot(
     record.materials.map((item, index) => normalizeMaterial(item, index)),
     categories.length > 0 ? categories : DEFAULT_CATEGORIES,
@@ -482,6 +543,7 @@ function parseSnapshotPayload(payload: unknown): AppSnapshot | null {
           );
         })
       : loadStoredOperationLogs(),
+    projects,
   );
 }
 
@@ -516,12 +578,14 @@ function parseHtmlTableBackup(text: string) {
           supplier: cells[5] || '',
           purchase_url: cells[6] || '',
           datasheet_url: cells[7] || '',
-          quantity: Number.parseInt(cells[8] || '0', 10) || 0,
-          low_stock_threshold: Number.parseInt(cells[9] || '5', 10) || 5,
-          location: cells[10] || '',
-          description: cells[11] || '',
-          created_at: cells[12] || new Date().toISOString(),
-          updated_at: cells[13] || new Date().toISOString(),
+          photo_url: cells.length >= 15 ? cells[8] || '' : '',
+          project: cells.length >= 16 ? cells[9] || '' : '',
+          quantity: Number.parseInt(cells[cells.length >= 16 ? 10 : cells.length >= 15 ? 9 : 8] || '0', 10) || 0,
+          low_stock_threshold: Number.parseInt(cells[cells.length >= 16 ? 11 : cells.length >= 15 ? 10 : 9] || '0', 10) || 0,
+          location: cells[cells.length >= 16 ? 12 : cells.length >= 15 ? 11 : 10] || '',
+          description: cells[cells.length >= 16 ? 13 : cells.length >= 15 ? 12 : 11] || '',
+          created_at: cells[cells.length >= 16 ? 14 : cells.length >= 15 ? 13 : 12] || new Date().toISOString(),
+          updated_at: cells[cells.length >= 16 ? 15 : cells.length >= 15 ? 14 : 13] || new Date().toISOString(),
         },
         index,
       );
@@ -582,15 +646,28 @@ function toSupabaseMaterial(material: Material) {
     supplier: _supplier,
     purchase_url: _purchaseUrl,
     datasheet_url: _datasheetUrl,
+    photo_url: _photoUrl,
     ...cloudMaterial
   } = material;
   return cloudMaterial;
+}
+
+function getImageExtension(file: File) {
+  const extension = file.name.split('.').pop()?.toLowerCase();
+  if (extension && /^[a-z0-9]+$/.test(extension)) return extension;
+
+  const mimeExtension = file.type.split('/')[1]?.toLowerCase();
+  return mimeExtension || 'jpg';
 }
 
 function openExternalLink(url: string) {
   if (!url) return;
   const href = /^https?:\/\//i.test(url) ? url : `https://${url}`;
   window.open(href, '_blank', 'noopener,noreferrer');
+}
+
+function isInteractiveElement(target: EventTarget | null) {
+  return target instanceof Element && Boolean(target.closest('button, input, select, textarea, a, label'));
 }
 
 interface SortableSidebarItemProps {
@@ -664,9 +741,14 @@ function App() {
   const [locations, setLocations] = useState<string[]>(() =>
     loadStoredList(STORAGE_KEYS.locations, DEFAULT_LOCATIONS),
   );
+  const [projects, setProjects] = useState<string[]>(() =>
+    loadStoredList(STORAGE_KEYS.projects, DEFAULT_PROJECTS),
+  );
   const [operationLogs, setOperationLogs] = useState<OperationLog[]>(() => loadStoredOperationLogs());
   const [selectedCategory, setSelectedCategory] = useState('全部');
-  const [quickFilter, setQuickFilter] = useState<'all' | 'attention' | 'empty' | 'unset-location'>('all');
+  const [quickFilter, setQuickFilter] = useState<
+    'all' | 'attention' | 'empty' | 'unset-location' | 'missing-image' | 'missing-datasheet' | 'missing-purchase'
+  >('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingMaterial, setEditingMaterial] = useState<Material | null>(null);
@@ -676,6 +758,8 @@ function App() {
   const [newCategoryName, setNewCategoryName] = useState('');
   const [isLocationModalOpen, setIsLocationModalOpen] = useState(false);
   const [newLocationName, setNewLocationName] = useState('');
+  const [isProjectModalOpen, setIsProjectModalOpen] = useState(false);
+  const [newProjectName, setNewProjectName] = useState('');
   const [isCategorySectionOpen, setIsCategorySectionOpen] = useState(true);
   const [isLocationSectionOpen, setIsLocationSectionOpen] = useState(true);
   const [backupMessage, setBackupMessage] = useState('本地备份待创建');
@@ -692,6 +776,9 @@ function App() {
   const [viewMode, setViewMode] = useState<'card' | 'table'>(() =>
     localStorage.getItem(STORAGE_KEYS.viewMode) === 'table' ? 'table' : 'card',
   );
+  const [theme, setTheme] = useState<'light' | 'dark'>(() =>
+    localStorage.getItem(STORAGE_KEYS.theme) === 'dark' ? 'dark' : 'light',
+  );
   const [cloudForm, setCloudForm] = useState(() => {
     const config = getSupabaseConfig();
     return { url: config.url, key: config.key };
@@ -702,6 +789,8 @@ function App() {
     mode: 'in' | 'out' | 'set';
     quantity: number;
   } | null>(null);
+  const [detailMaterialId, setDetailMaterialId] = useState<number | null>(null);
+  const [previewImageUrl, setPreviewImageUrl] = useState('');
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const sortableSensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
 
@@ -714,11 +803,16 @@ function App() {
     supplier: '',
     purchase_url: '',
     datasheet_url: '',
+    photo_url: '',
+    project: '',
     description: '',
     quantity: 0,
-    low_stock_threshold: 5,
+    low_stock_threshold: 0,
     location: '',
   });
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [imagePreviewUrl, setImagePreviewUrl] = useState('');
+  const [isUploadingImage, setIsUploadingImage] = useState(false);
   const realtimeChannelRef = useRef<ReturnType<SupabaseClient['channel']> | null>(null);
   const realtimeRefreshTimerRef = useRef<number | null>(null);
   const cloudPollingTimerRef = useRef<number | null>(null);
@@ -794,7 +888,13 @@ function App() {
     }
 
     await persistSnapshot(
-      createSnapshot(orderedMaterials, localSnapshot.categories, localSnapshot.locations, localSnapshot.operation_logs),
+      createSnapshot(
+        orderedMaterials,
+        localSnapshot.categories,
+        localSnapshot.locations,
+        localSnapshot.operation_logs,
+        localSnapshot.projects,
+      ),
     );
     setCloudMessage(`已自动同步${sourceLabel}物料：${new Date().toLocaleString()}`);
     setIsOnline(true);
@@ -906,6 +1006,7 @@ function App() {
       setMaterials(snapshot.materials);
       setCategories(snapshot.categories);
       setLocations(snapshot.locations);
+      setProjects(snapshot.projects);
       setOperationLogs(snapshot.operation_logs);
     }
 
@@ -994,6 +1095,7 @@ function App() {
       setMaterials(localSnapshot.materials);
       setCategories(localSnapshot.categories);
       setLocations(localSnapshot.locations);
+      setProjects(localSnapshot.projects);
       setOperationLogs(localSnapshot.operation_logs);
 
       if (IS_TAURI) {
@@ -1030,10 +1132,12 @@ function App() {
     let nextMaterials = [...currentSnapshot.materials];
     let nextLogs = currentSnapshot.operation_logs;
     let nextMaterial: Material;
+    let shouldUpdateCloudMaterial = false;
 
     if (isEditing) {
       const index = nextMaterials.findIndex((item) => item.id === material.id);
       if (index >= 0) {
+        shouldUpdateCloudMaterial = true;
         const previousMaterial = nextMaterials[index];
         nextMaterial = normalizeMaterial({ ...nextMaterials[index], ...material, updated_at: now }, index);
         nextMaterials[index] = nextMaterial;
@@ -1047,6 +1151,9 @@ function App() {
         if (previousMaterial.location !== nextMaterial.location) {
           details.push(`位置 ${previousMaterial.location || '未设置'} -> ${nextMaterial.location || '未设置'}`);
         }
+        if (previousMaterial.project !== nextMaterial.project) {
+          details.push(`项目 ${previousMaterial.project || '未设置'} -> ${nextMaterial.project || '未设置'}`);
+        }
         if (previousMaterial.package !== nextMaterial.package) {
           details.push(`封装 ${previousMaterial.package || '未填'} -> ${nextMaterial.package || '未填'}`);
         }
@@ -1058,6 +1165,9 @@ function App() {
         }
         if (previousMaterial.low_stock_threshold !== nextMaterial.low_stock_threshold) {
           details.push(`预警值 ${previousMaterial.low_stock_threshold} -> ${nextMaterial.low_stock_threshold}`);
+        }
+        if (previousMaterial.photo_url !== nextMaterial.photo_url) {
+          details.push(nextMaterial.photo_url ? '图片已更新' : '图片已移除');
         }
         if (details.length > 0) {
           nextLogs = [createOperationLog(nextMaterial, actionLabel, details.join('，')), ...nextLogs].slice(0, 80);
@@ -1076,7 +1186,7 @@ function App() {
       nextLogs = [createOperationLog(nextMaterial, '新增', '新增物料'), ...nextLogs].slice(0, 80);
     }
 
-    await persistSnapshot(createSnapshot(nextMaterials, categories, locations, nextLogs));
+    await persistSnapshot(createSnapshot(nextMaterials, categories, locations, nextLogs, projects));
 
     const cloud = initSupabase();
     if (!cloud) {
@@ -1085,7 +1195,7 @@ function App() {
     }
 
     try {
-      if (isEditing) {
+      if (shouldUpdateCloudMaterial) {
         const { error } = await cloud
           .from('materials')
           .update({ ...toSupabaseMaterial(nextMaterial), updated_at: now })
@@ -1103,6 +1213,32 @@ function App() {
     }
   }
 
+  async function uploadMaterialImage(file: File, materialId: number) {
+    const cloud = initSupabase();
+    if (!cloud) {
+      setIsCloudModalOpen(true);
+      throw new Error('请先配置 Supabase 云端备份，再上传器件图片。');
+    }
+
+    const { data } = await cloud.auth.getUser();
+    const user = data.user;
+    if (!user) {
+      openAuthModal();
+      throw new Error('请先登录云端账号，再上传器件图片。');
+    }
+
+    const path = `${user.id}/${materialId}/${Date.now()}.${getImageExtension(file)}`;
+    const { error } = await cloud.storage.from(MATERIAL_IMAGE_BUCKET).upload(path, file, {
+      cacheControl: '31536000',
+      upsert: true,
+    });
+
+    if (error) throw error;
+
+    const { data: publicUrlData } = cloud.storage.from(MATERIAL_IMAGE_BUCKET).getPublicUrl(path);
+    return publicUrlData.publicUrl;
+  }
+
   async function deleteMaterial(id: number) {
     if (!confirm('确定要删除这条物料吗？')) return;
 
@@ -1113,7 +1249,7 @@ function App() {
       ? [createOperationLog(deletedMaterial, '删除', '删除物料'), ...currentSnapshot.operation_logs].slice(0, 80)
       : currentSnapshot.operation_logs;
     await persistSnapshot(
-      createSnapshot(nextMaterials, currentSnapshot.categories, currentSnapshot.locations, nextLogs),
+      createSnapshot(nextMaterials, currentSnapshot.categories, currentSnapshot.locations, nextLogs, currentSnapshot.projects),
     );
 
     const cloud = initSupabase();
@@ -1145,6 +1281,12 @@ function App() {
   function updateViewMode(nextMode: 'card' | 'table') {
     setViewMode(nextMode);
     localStorage.setItem(STORAGE_KEYS.viewMode, nextMode);
+  }
+
+  function toggleTheme() {
+    const nextTheme = theme === 'dark' ? 'light' : 'dark';
+    setTheme(nextTheme);
+    localStorage.setItem(STORAGE_KEYS.theme, nextTheme);
   }
 
   function openStockModal(material: Material, mode: 'in' | 'out' | 'set') {
@@ -1189,11 +1331,15 @@ function App() {
   }
 
   async function saveCategories(nextCategories: string[]) {
-    await persistSnapshot(createSnapshot(materials, nextCategories, locations));
+    await persistSnapshot(createSnapshot(materials, nextCategories, locations, operationLogs, projects));
   }
 
   async function saveLocations(nextLocations: string[]) {
-    await persistSnapshot(createSnapshot(materials, categories, nextLocations));
+    await persistSnapshot(createSnapshot(materials, categories, nextLocations, operationLogs, projects));
+  }
+
+  async function saveProjects(nextProjects: string[]) {
+    await persistSnapshot(createSnapshot(materials, categories, locations, operationLogs, nextProjects));
   }
 
   async function handleCategorySortEnd(event: DragEndEvent) {
@@ -1217,7 +1363,7 @@ function App() {
   async function moveMaterialByStep(materialId: number, direction: 'up' | 'down') {
     const fromIndex = materials.findIndex((item) => item.id === materialId);
     const toIndex = direction === 'up' ? fromIndex - 1 : fromIndex + 1;
-    await persistSnapshot(createSnapshot(reorderItems(materials, fromIndex, toIndex), categories, locations));
+    await persistSnapshot(createSnapshot(reorderItems(materials, fromIndex, toIndex), categories, locations, operationLogs, projects));
   }
 
   async function handleCategoryDelete(category: string) {
@@ -1255,7 +1401,7 @@ function App() {
       ...operationLogs,
     ].slice(0, 80);
 
-    await persistSnapshot(createSnapshot(nextMaterials, nextCategories, locations, nextLogs));
+    await persistSnapshot(createSnapshot(nextMaterials, nextCategories, locations, nextLogs, projects));
   }
 
   async function handleLocationDelete(location: string) {
@@ -1293,11 +1439,13 @@ function App() {
       ...operationLogs,
     ].slice(0, 80);
 
-    await persistSnapshot(createSnapshot(nextMaterials, categories, nextLocations, nextLogs));
+    await persistSnapshot(createSnapshot(nextMaterials, categories, nextLocations, nextLogs, projects));
   }
 
   function openAddModal() {
     setEditingMaterial(null);
+    setImageFile(null);
+    setImagePreviewUrl('');
     setFormData({
       name: '',
       model: '',
@@ -1307,9 +1455,11 @@ function App() {
       supplier: '',
       purchase_url: '',
       datasheet_url: '',
+      photo_url: '',
+      project: '',
       description: '',
       quantity: 0,
-      low_stock_threshold: 5,
+      low_stock_threshold: 0,
       location: '',
     });
     setIsModalOpen(true);
@@ -1317,6 +1467,8 @@ function App() {
 
   function openEditModal(material: Material) {
     setEditingMaterial(material);
+    setImageFile(null);
+    setImagePreviewUrl(material.photo_url);
     setFormData({
       name: material.name,
       model: material.model,
@@ -1326,6 +1478,8 @@ function App() {
       supplier: material.supplier,
       purchase_url: material.purchase_url,
       datasheet_url: material.datasheet_url,
+      photo_url: material.photo_url,
+      project: material.project,
       description: material.description,
       quantity: material.quantity,
       low_stock_threshold: material.low_stock_threshold,
@@ -1334,17 +1488,51 @@ function App() {
     setIsModalOpen(true);
   }
 
-  function handleSubmit(event: React.FormEvent) {
+  async function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
-    void saveMaterial({
-      ...formData,
-      id: editingMaterial?.id,
-    });
-    setIsModalOpen(false);
+    const materialId = editingMaterial?.id ?? Date.now();
+
+    try {
+      setIsUploadingImage(true);
+      const photoUrl = imageFile ? await uploadMaterialImage(imageFile, materialId) : formData.photo_url;
+      await saveMaterial({
+        ...formData,
+        id: materialId,
+        photo_url: photoUrl,
+      });
+      setImageFile(null);
+      setImagePreviewUrl('');
+      setIsModalOpen(false);
+    } catch (error) {
+      console.error('保存物料失败:', error);
+      alert(error instanceof Error ? error.message : '保存失败，请稍后再试。');
+    } finally {
+      setIsUploadingImage(false);
+    }
+  }
+
+  function handleImageChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0] ?? null;
+    if (!file) return;
+
+    if (!file.type.startsWith('image/')) {
+      alert('请选择图片文件。');
+      event.target.value = '';
+      return;
+    }
+
+    if (file.size > 5 * 1024 * 1024) {
+      alert('图片不能超过 5MB。');
+      event.target.value = '';
+      return;
+    }
+
+    setImageFile(file);
+    setImagePreviewUrl(URL.createObjectURL(file));
   }
 
   function handleExport() {
-    const snapshot = createSnapshot(materials, categories, locations);
+    const snapshot = createSnapshot(materials, categories, locations, operationLogs, projects);
     downloadFile(
       buildExcelHtml(snapshot),
       `warehouse-backup-${new Date().toISOString().slice(0, 10)}.xls`,
@@ -1383,7 +1571,7 @@ function App() {
 
       localStorage.setItem(STORAGE_KEYS.backupDir, selected);
       setBackupDir(selected);
-      await persistSnapshot(createSnapshot(materials, categories, locations), false);
+      await persistSnapshot(createSnapshot(materials, categories, locations, operationLogs, projects), false);
       alert(`备份目录已更新为：${selected}`);
     } catch (error) {
       console.error('选择备份目录失败:', error);
@@ -1394,7 +1582,7 @@ function App() {
   async function handleResetBackupDir() {
     localStorage.removeItem(STORAGE_KEYS.backupDir);
     setBackupDir('');
-    await persistSnapshot(createSnapshot(materials, categories, locations), false);
+    await persistSnapshot(createSnapshot(materials, categories, locations, operationLogs, projects), false);
     alert('已恢复为默认备份目录。');
   }
 
@@ -1471,11 +1659,18 @@ function App() {
         return;
       }
 
+      const { error: storageError } = await testClient.storage.from(MATERIAL_IMAGE_BUCKET).list('', { limit: 1 });
+      if (storageError) {
+        setIsOnline(false);
+        setCloudCheckMessage(`项目可连接，但图片存储桶或权限不可用：${storageError.message}`);
+        return;
+      }
+
       setIsOnline(true);
       setCloudCheckMessage(
         sessionData.session
-          ? '检查通过：项目可连接，已登录账号，备份表可访问。'
-          : '检查通过：项目可连接，备份表可访问。请登录账号后上传或恢复备份。',
+          ? '检查通过：项目可连接，已登录账号，备份表和图片存储可访问。'
+          : '检查通过：项目可连接，备份表和图片存储可访问。请登录账号后上传或恢复备份。',
       );
     } catch (error) {
       console.error('检查云端连接失败:', error);
@@ -1558,7 +1753,7 @@ function App() {
   }
 
   async function handleUploadCloudBackup() {
-    const snapshot = createSnapshot(materials, categories, locations);
+    const snapshot = createSnapshot(materials, categories, locations, operationLogs, projects);
 
     try {
       const uploaded = await uploadCloudSnapshot(snapshot, true);
@@ -1634,7 +1829,10 @@ function App() {
       quickFilter === 'all' ||
       (quickFilter === 'attention' && (item.quantity === 0 || isLowStock(item))) ||
       (quickFilter === 'empty' && item.quantity === 0) ||
-      (quickFilter === 'unset-location' && !item.location);
+      (quickFilter === 'unset-location' && !item.location) ||
+      (quickFilter === 'missing-image' && !item.photo_url) ||
+      (quickFilter === 'missing-datasheet' && !item.datasheet_url) ||
+      (quickFilter === 'missing-purchase' && !item.purchase_url);
     const query = searchQuery.trim().toLowerCase();
 
     const matchSearch =
@@ -1645,6 +1843,7 @@ function App() {
       item.package.toLowerCase().includes(query) ||
       item.parameters.toLowerCase().includes(query) ||
       item.supplier.toLowerCase().includes(query) ||
+      item.project.toLowerCase().includes(query) ||
       item.location.toLowerCase().includes(query) ||
       item.description.toLowerCase().includes(query);
 
@@ -1655,10 +1854,20 @@ function App() {
   const outOfStockCount = materials.filter((item) => item.quantity === 0).length;
   const lowStockCount = materials.filter((item) => isLowStock(item)).length;
   const unsetLocationCount = materials.filter((item) => !item.location).length;
+  const missingImageCount = materials.filter((item) => !item.photo_url).length;
+  const missingDatasheetCount = materials.filter((item) => !item.datasheet_url).length;
+  const missingPurchaseCount = materials.filter((item) => !item.purchase_url).length;
+  const incompleteMaterialCount = materials.filter(
+    (item) => !item.photo_url || !item.datasheet_url || !item.purchase_url || !item.location,
+  ).length;
   const usedLocationCount = new Set(materials.map((item) => item.location).filter(Boolean)).size;
+  const detailMaterial = detailMaterialId ? materials.find((item) => item.id === detailMaterialId) ?? null : null;
+  const detailLogs = detailMaterial
+    ? operationLogs.filter((log) => log.material_id === detailMaterial.id).slice(0, 5)
+    : [];
 
   return (
-    <div className="app">
+    <div className={`app ${theme === 'dark' ? 'dark-theme' : ''}`}>
       <input
         ref={importInputRef}
         type="file"
@@ -1686,6 +1895,9 @@ function App() {
             <span className={`sync-dot ${isOnline ? '' : 'offline'}`}></span>
             {isOnline ? '云端同步' : '本地模式'}
           </div>
+          <button type="button" className="theme-toggle" onClick={toggleTheme}>
+            {theme === 'dark' ? '日间' : '夜间'}
+          </button>
         </div>
       </header>
 
@@ -1710,6 +1922,41 @@ function App() {
           <strong>{usedLocationCount}</strong>
           <small>共维护 {locations.length} 个位置</small>
         </div>
+      </section>
+
+      <section className="health-strip" aria-label="资料完整度">
+        <div className="health-summary">
+          <span>资料完整度</span>
+          <strong>{materials.length > 0 ? `${materials.length - incompleteMaterialCount}/${materials.length}` : '0/0'}</strong>
+        </div>
+        <button
+          type="button"
+          className={quickFilter === 'missing-image' ? 'active' : ''}
+          onClick={() => setQuickFilter('missing-image')}
+        >
+          无图 <strong>{missingImageCount}</strong>
+        </button>
+        <button
+          type="button"
+          className={quickFilter === 'missing-datasheet' ? 'active' : ''}
+          onClick={() => setQuickFilter('missing-datasheet')}
+        >
+          无规格书 <strong>{missingDatasheetCount}</strong>
+        </button>
+        <button
+          type="button"
+          className={quickFilter === 'missing-purchase' ? 'active' : ''}
+          onClick={() => setQuickFilter('missing-purchase')}
+        >
+          无购买链接 <strong>{missingPurchaseCount}</strong>
+        </button>
+        <button
+          type="button"
+          className={quickFilter === 'unset-location' ? 'active' : ''}
+          onClick={() => setQuickFilter('unset-location')}
+        >
+          未设位置 <strong>{unsetLocationCount}</strong>
+        </button>
       </section>
 
       <div className="backup-banner">
@@ -1887,6 +2134,24 @@ function App() {
             >
               未设位置 {unsetLocationCount}
             </button>
+            <button
+              className={quickFilter === 'missing-image' ? 'active' : ''}
+              onClick={() => setQuickFilter('missing-image')}
+            >
+              无图 {missingImageCount}
+            </button>
+            <button
+              className={quickFilter === 'missing-datasheet' ? 'active' : ''}
+              onClick={() => setQuickFilter('missing-datasheet')}
+            >
+              无规格书 {missingDatasheetCount}
+            </button>
+            <button
+              className={quickFilter === 'missing-purchase' ? 'active' : ''}
+              onClick={() => setQuickFilter('missing-purchase')}
+            >
+              无购买链接 {missingPurchaseCount}
+            </button>
           </div>
 
           {isLoading ? (
@@ -1902,12 +2167,14 @@ function App() {
               <table className="material-table">
                 <thead>
                   <tr>
+                    <th>图片</th>
                     <th>名称</th>
                     <th>型号</th>
                     <th>封装</th>
                     <th>参数</th>
                     <th>分类</th>
                     <th>位置</th>
+                    <th>项目</th>
                     <th>库存</th>
                     <th>预警</th>
                     <th>资料</th>
@@ -1919,7 +2186,28 @@ function App() {
                     const materialIndex = materials.findIndex((item) => item.id === material.id);
 
                     return (
-                      <tr key={material.id} className={material.quantity === 0 ? 'is-empty' : isLowStock(material) ? 'is-low' : ''}>
+                      <tr
+                        key={material.id}
+                        className={material.quantity === 0 ? 'is-empty' : isLowStock(material) ? 'is-low' : ''}
+                        onDoubleClick={(event) => {
+                          if (isInteractiveElement(event.target)) return;
+                          openEditModal(material);
+                        }}
+                      >
+                        <td>
+                          {material.photo_url ? (
+                            <button
+                              type="button"
+                              className="image-thumb-button"
+                              onClick={() => setPreviewImageUrl(material.photo_url)}
+                              title="查看器件图片"
+                            >
+                              <img src={material.photo_url} alt={material.name} className="material-thumb small" />
+                            </button>
+                          ) : (
+                            <span className="image-placeholder small">无</span>
+                          )}
+                        </td>
                         <td>
                           <strong>{material.name}</strong>
                           {material.quantity === 0 ? <span className="stock-badge danger">缺货</span> : null}
@@ -1953,6 +2241,7 @@ function App() {
                             ))}
                           </select>
                         </td>
+                        <td>{material.project || '-'}</td>
                         <td>
                           <button className="quantity-pill" onClick={() => openStockModal(material, 'set')}>
                             {material.quantity}
@@ -2005,7 +2294,25 @@ function App() {
                   <div
                     key={material.id}
                     className={`material-item ${material.quantity === 0 ? 'is-empty' : isLowStock(material) ? 'is-low' : ''}`}
+                    onDoubleClick={(event) => {
+                      if (isInteractiveElement(event.target)) return;
+                      openEditModal(material);
+                    }}
                   >
+                    <div className="material-photo">
+                      {material.photo_url ? (
+                        <button
+                          type="button"
+                          className="image-thumb-button"
+                          onClick={() => setPreviewImageUrl(material.photo_url)}
+                          title="查看器件图片"
+                        >
+                          <img src={material.photo_url} alt={material.name} className="material-thumb" />
+                        </button>
+                      ) : (
+                        <span className="image-placeholder">无图</span>
+                      )}
+                    </div>
                   <div className="material-info">
                     <div className="material-title-row">
                       <h4>{material.name}</h4>
@@ -2018,37 +2325,55 @@ function App() {
                       {material.parameters ? <p>参数：{material.parameters}</p> : null}
                       {material.supplier ? <p>供应商：{material.supplier}</p> : null}
                       <p>预警：{material.low_stock_threshold}</p>
-                      <label className="meta-field">
-                        <span>分类</span>
-                        <select
-                          value={material.category}
-                          onChange={(event) =>
-                            void updateMaterialField(material, 'category', event.target.value)
-                          }
-                        >
-                          {categories.map((category) => (
-                            <option key={category} value={category}>
-                              {category}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                      <label className="meta-field">
-                        <span>位置</span>
-                        <select
-                          value={material.location}
-                          onChange={(event) =>
-                            void updateMaterialField(material, 'location', event.target.value)
-                          }
-                        >
-                          <option value="">未设置</option>
-                          {locations.map((location) => (
-                            <option key={location} value={location}>
-                              {location}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
+                      <div className="meta-controls-row">
+                        <label className="meta-field">
+                          <span>分类</span>
+                          <select
+                            value={material.category}
+                            onChange={(event) =>
+                              void updateMaterialField(material, 'category', event.target.value)
+                            }
+                          >
+                            {categories.map((category) => (
+                              <option key={category} value={category}>
+                                {category}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="meta-field">
+                          <span>位置</span>
+                          <select
+                            value={material.location}
+                            onChange={(event) =>
+                              void updateMaterialField(material, 'location', event.target.value)
+                            }
+                          >
+                            <option value="">未设置</option>
+                            {locations.map((location) => (
+                              <option key={location} value={location}>
+                                {location}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="meta-field meta-project">
+                          <span>项目</span>
+                          <select
+                            value={material.project}
+                            onChange={(event) =>
+                              void updateMaterialField(material, 'project', event.target.value)
+                            }
+                          >
+                            <option value="">未关联</option>
+                            {projects.map((project) => (
+                              <option key={project} value={project}>
+                                {project}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      </div>
                     </div>
                     {material.purchase_url || material.datasheet_url ? (
                       <div className="material-links">
@@ -2067,11 +2392,12 @@ function App() {
                       <div className="stock-actions">
                         <button onClick={() => void updateQuantity(material.id, -1)}>-1</button>
                         <button onClick={() => void updateQuantity(material.id, 1)}>+1</button>
-                        <button onClick={() => openStockModal(material, 'in')}>入库</button>
-                        <button onClick={() => openStockModal(material, 'out')}>出库</button>
+                        <button onClick={() => openStockModal(material, 'set')}>盘点</button>
                       </div>
                     </div>
                     <div className="material-actions">
+                      <button onClick={() => setDetailMaterialId(material.id)}>详情</button>
+                      <button onClick={() => openEditModal(material)}>编辑</button>
                       <button
                         onClick={() => void moveMaterialByStep(material.id, 'up')}
                         disabled={materialIndex === 0}
@@ -2084,8 +2410,9 @@ function App() {
                       >
                         下移
                       </button>
-                      <button onClick={() => openEditModal(material)}>编辑</button>
-                      <button onClick={() => void deleteMaterial(material.id)}>删除</button>
+                      <button className="danger-action" onClick={() => void deleteMaterial(material.id)}>
+                        删除
+                      </button>
                     </div>
                   </div>
                 );
@@ -2116,6 +2443,121 @@ function App() {
           </section>
         </main>
       </div>
+
+      {detailMaterial ? (
+        <div className="modal-overlay" onClick={() => setDetailMaterialId(null)}>
+          <div className="modal detail-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="detail-header">
+              <div>
+                <h2>{detailMaterial.name}</h2>
+                <div className="detail-badges">
+                  {detailMaterial.quantity === 0 ? <span className="stock-badge danger">缺货</span> : null}
+                  {isLowStock(detailMaterial) ? <span className="stock-badge warning">低库存</span> : null}
+                  <span>{detailMaterial.category}</span>
+                  <span>{detailMaterial.location || '未设位置'}</span>
+                  <span>{detailMaterial.project || '未关联项目'}</span>
+                </div>
+              </div>
+              <button type="button" className="icon-close" onClick={() => setDetailMaterialId(null)}>
+                ×
+              </button>
+            </div>
+
+            <div className="detail-layout">
+              <button
+                type="button"
+                className="detail-photo"
+                onClick={() => detailMaterial.photo_url && setPreviewImageUrl(detailMaterial.photo_url)}
+                disabled={!detailMaterial.photo_url}
+              >
+                {detailMaterial.photo_url ? (
+                  <img src={detailMaterial.photo_url} alt={detailMaterial.name} />
+                ) : (
+                  <span>无图</span>
+                )}
+              </button>
+
+              <div className="detail-main">
+                <div className="detail-stock-panel">
+                  <div>
+                    <span>当前库存</span>
+                    <strong>{detailMaterial.quantity}</strong>
+                  </div>
+                  <div className="detail-stock-actions">
+                    <button onClick={() => void updateQuantity(detailMaterial.id, -1)}>-1</button>
+                    <button onClick={() => void updateQuantity(detailMaterial.id, 1)}>+1</button>
+                    <button onClick={() => openStockModal(detailMaterial, 'in')}>入库</button>
+                    <button onClick={() => openStockModal(detailMaterial, 'out')}>出库</button>
+                    <button onClick={() => openStockModal(detailMaterial, 'set')}>盘点</button>
+                  </div>
+                </div>
+
+                <div className="detail-grid">
+                  <div><span>型号</span><strong>{detailMaterial.model || '-'}</strong></div>
+                  <div><span>封装</span><strong>{detailMaterial.package || '-'}</strong></div>
+                  <div><span>参数</span><strong>{detailMaterial.parameters || '-'}</strong></div>
+                  <div><span>供应商</span><strong>{detailMaterial.supplier || '-'}</strong></div>
+                  <div><span>关联项目</span><strong>{detailMaterial.project || '-'}</strong></div>
+                  <div><span>低库存预警</span><strong>{detailMaterial.low_stock_threshold}</strong></div>
+                  <div><span>更新时间</span><strong>{new Date(detailMaterial.updated_at).toLocaleString()}</strong></div>
+                </div>
+
+                {detailMaterial.description ? (
+                  <div className="detail-note">
+                    <span>备注</span>
+                    <p>{detailMaterial.description}</p>
+                  </div>
+                ) : null}
+
+                <div className="detail-actions">
+                  {detailMaterial.purchase_url ? (
+                    <button onClick={() => openExternalLink(detailMaterial.purchase_url)}>购买链接</button>
+                  ) : null}
+                  {detailMaterial.datasheet_url ? (
+                    <button onClick={() => openExternalLink(detailMaterial.datasheet_url)}>规格书</button>
+                  ) : null}
+                  <button
+                    onClick={() => {
+                      setDetailMaterialId(null);
+                      openEditModal(detailMaterial);
+                    }}
+                  >
+                    编辑物料
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <section className="detail-log-panel">
+              <strong>近期记录</strong>
+              {detailLogs.length > 0 ? (
+                <ul>
+                  {detailLogs.map((log) => (
+                    <li key={log.id}>
+                      <span>{log.action}</span>
+                      <p>{log.detail}</p>
+                      <time>{new Date(log.created_at).toLocaleString()}</time>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p>暂无该物料的操作记录。</p>
+              )}
+            </section>
+          </div>
+        </div>
+      ) : null}
+
+      {previewImageUrl ? (
+        <div className="modal-overlay image-preview-overlay" onClick={() => setPreviewImageUrl('')}>
+          <div className="image-preview-modal" onClick={(event) => event.stopPropagation()}>
+            <button type="button" className="icon-close" onClick={() => setPreviewImageUrl('')}>
+              ×
+            </button>
+            <img src={previewImageUrl} alt="器件图片预览" />
+          </div>
+        </div>
+      ) : null}
 
       {isModalOpen ? (
         <div className="modal-overlay" onClick={() => setIsModalOpen(false)}>
@@ -2283,6 +2725,75 @@ function App() {
               </div>
 
               <div className="form-group">
+                <label>关联项目</label>
+                <div style={{ display: 'flex', gap: '0.5rem' }}>
+                  <select
+                    value={formData.project}
+                    onChange={(event) => setFormData({ ...formData, project: event.target.value })}
+                    style={{ flex: 1 }}
+                  >
+                    <option value="">未关联项目</option>
+                    {projects.map((project) => (
+                      <option key={project} value={project}>
+                        {project}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    className="add-btn"
+                    title="新增项目"
+                    onClick={() => setIsProjectModalOpen(true)}
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
+
+              <div className="form-group">
+                <label>器件图片</label>
+                <div className="image-upload-row">
+                  <label className="image-upload-box">
+                    {imagePreviewUrl ? (
+                      <img src={imagePreviewUrl} alt="器件图片预览" />
+                    ) : (
+                      <span className="image-upload-empty">
+                        <strong aria-hidden="true" />
+                        <small>添加图片</small>
+                      </span>
+                    )}
+                    <input type="file" accept="image/*" onChange={handleImageChange} />
+                  </label>
+                  <div className="image-upload-actions">
+                    <strong>{imagePreviewUrl ? '器件图片已选择' : '上传一张器件照片'}</strong>
+                    <span>保存后上传到云端，支持 JPG、PNG、WebP、GIF，最大 5MB。</span>
+                    <label className="secondary-inline image-upload-trigger">
+                      {imagePreviewUrl ? '更换图片' : '选择图片'}
+                      <input type="file" accept="image/*" onChange={handleImageChange} />
+                    </label>
+                    {formData.photo_url ? (
+                      <button type="button" className="secondary-inline" onClick={() => openExternalLink(formData.photo_url)}>
+                        查看云端图片
+                      </button>
+                    ) : null}
+                    {imagePreviewUrl ? (
+                      <button
+                        type="button"
+                        className="secondary-inline"
+                        onClick={() => {
+                          setImageFile(null);
+                          setImagePreviewUrl('');
+                          setFormData({ ...formData, photo_url: '' });
+                        }}
+                      >
+                        移除图片
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              </div>
+
+              <div className="form-group">
                 <label>备注</label>
                 <textarea
                   value={formData.description}
@@ -2295,8 +2806,8 @@ function App() {
                 <button type="button" className="cancel" onClick={() => setIsModalOpen(false)}>
                   取消
                 </button>
-                <button type="submit" className="save">
-                  保存
+                <button type="submit" className="save" disabled={isUploadingImage}>
+                  {isUploadingImage ? '上传中...' : '保存'}
                 </button>
               </div>
             </form>
@@ -2381,8 +2892,8 @@ function App() {
                 <section className="setup-step">
                   <span>2</span>
                   <div>
-                    <strong>创建备份表和权限</strong>
-                    <p>把下面 SQL 粘贴到 Supabase SQL Editor 执行。它只允许登录用户读写自己的备份。</p>
+                    <strong>创建备份、图片存储和权限</strong>
+                    <p>把下面 SQL 粘贴到 Supabase SQL Editor 执行。备份和图片写入都限定在登录账号名下。</p>
                     <div className="cloud-note">
                       <code>{CLOUD_SETUP_SQL}</code>
                     </div>
@@ -2396,7 +2907,7 @@ function App() {
                   <span>3</span>
                   <div>
                     <strong>检查连接</strong>
-                    <p>检查项目能否访问、备份表是否存在、权限是否正确。</p>
+                    <p>检查项目能否访问、备份表和存储权限是否正确。</p>
                     {cloudCheckMessage ? <div className="cloud-check-result">{cloudCheckMessage}</div> : null}
                   </div>
                 </section>
@@ -2565,6 +3076,49 @@ function App() {
 
               <div className="modal-actions">
                 <button type="button" className="cancel" onClick={() => setIsLocationModalOpen(false)}>
+                  取消
+                </button>
+                <button type="submit" className="save">
+                  添加
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
+
+      {isProjectModalOpen ? (
+        <div className="modal-overlay" onClick={() => setIsProjectModalOpen(false)}>
+          <div className="modal" onClick={(event) => event.stopPropagation()}>
+            <h2>新增项目</h2>
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                const value = newProjectName.trim();
+                if (!value) return;
+                if (projects.includes(value)) {
+                  alert('这个项目已经存在。');
+                  return;
+                }
+                setNewProjectName('');
+                setIsProjectModalOpen(false);
+                setFormData({ ...formData, project: value });
+                void saveProjects([...projects, value]);
+              }}
+            >
+              <div className="form-group">
+                <label>项目名称 *</label>
+                <input
+                  type="text"
+                  value={newProjectName}
+                  onChange={(event) => setNewProjectName(event.target.value)}
+                  placeholder="例如：温控板 / 电源模块 / 机器人底盘"
+                  required
+                />
+              </div>
+
+              <div className="modal-actions">
+                <button type="button" className="cancel" onClick={() => setIsProjectModalOpen(false)}>
                   取消
                 </button>
                 <button type="submit" className="save">
