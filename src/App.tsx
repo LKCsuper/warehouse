@@ -1488,6 +1488,29 @@ function App() {
     setIsModalOpen(true);
   }
 
+  function openCopyModal(material: Material) {
+    setEditingMaterial(null);
+    setImageFile(null);
+    setImagePreviewUrl(material.photo_url);
+    setFormData({
+      name: material.name,
+      model: material.model,
+      category: material.category,
+      package: material.package,
+      parameters: material.parameters,
+      supplier: material.supplier,
+      purchase_url: material.purchase_url,
+      datasheet_url: material.datasheet_url,
+      photo_url: material.photo_url,
+      project: material.project,
+      description: material.description,
+      quantity: 0,
+      low_stock_threshold: material.low_stock_threshold,
+      location: material.location,
+    });
+    setIsModalOpen(true);
+  }
+
   async function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
     const materialId = editingMaterial?.id ?? Date.now();
@@ -2238,6 +2261,7 @@ function App() {
                               下移
                             </button>
                             <button onClick={() => openEditModal(material)}>编辑</button>
+                            <button onClick={() => openCopyModal(material)}>复制</button>
                             <button onClick={() => void deleteMaterial(material.id)}>删除</button>
                           </div>
                         </td>
@@ -2360,6 +2384,7 @@ function App() {
                     <div className="material-actions">
                       <button onClick={() => setDetailMaterialId(material.id)}>详情</button>
                       <button onClick={() => openEditModal(material)}>编辑</button>
+                      <button onClick={() => openCopyModal(material)}>复制</button>
                       <button
                         onClick={() => void moveMaterialByStep(material.id, 'up')}
                         disabled={materialIndex === 0}
