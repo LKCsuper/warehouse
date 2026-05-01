@@ -1443,13 +1443,18 @@ function App() {
   }
 
   function openAddModal() {
+    const defaultCategory =
+      selectedCategory !== '全部' && categories.includes(selectedCategory)
+        ? selectedCategory
+        : categories[0] || '其他';
+
     setEditingMaterial(null);
     setImageFile(null);
     setImagePreviewUrl('');
     setFormData({
       name: '',
       model: '',
-      category: categories[0] || '其他',
+      category: defaultCategory,
       package: '',
       parameters: '',
       supplier: '',
