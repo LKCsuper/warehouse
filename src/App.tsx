@@ -26,6 +26,7 @@ interface Material {
   package: string;
   parameters: string;
   supplier: string;
+  purchase_price: number;
   purchase_url: string;
   datasheet_url: string;
   photo_url: string;
@@ -229,6 +230,10 @@ function normalizeMaterial(value: Partial<Material>, index = 0): Material {
     package: typeof value.package === 'string' ? value.package : '',
     parameters: typeof value.parameters === 'string' ? value.parameters : '',
     supplier: typeof value.supplier === 'string' ? value.supplier : '',
+    purchase_price:
+      typeof value.purchase_price === 'number'
+        ? Math.max(0, value.purchase_price)
+        : Math.max(0, Number.parseFloat(String(value.purchase_price ?? 0)) || 0),
     purchase_url: typeof value.purchase_url === 'string' ? value.purchase_url : '',
     datasheet_url: typeof value.datasheet_url === 'string' ? value.datasheet_url : '',
     photo_url: typeof value.photo_url === 'string' ? value.photo_url : '',
@@ -415,6 +420,7 @@ function buildExcelHtml(snapshot: AppSnapshot) {
           <td>${escapeHtml(item.package)}</td>
           <td>${escapeHtml(item.parameters)}</td>
           <td>${escapeHtml(item.supplier)}</td>
+          <td>${item.purchase_price}</td>
           <td>${escapeHtml(item.purchase_url)}</td>
           <td>${escapeHtml(item.datasheet_url)}</td>
           <td>${escapeHtml(item.photo_url)}</td>
@@ -455,6 +461,7 @@ function buildExcelHtml(snapshot: AppSnapshot) {
         <th>封装</th>
         <th>参数</th>
         <th>供应商</th>
+        <th>购买价格</th>
         <th>购买链接</th>
         <th>规格书</th>
         <th>图片</th>
@@ -576,16 +583,23 @@ function parseHtmlTableBackup(text: string) {
           package: cells[3] || '',
           parameters: cells[4] || '',
           supplier: cells[5] || '',
-          purchase_url: cells[6] || '',
-          datasheet_url: cells[7] || '',
-          photo_url: cells.length >= 15 ? cells[8] || '' : '',
-          project: cells.length >= 16 ? cells[9] || '' : '',
-          quantity: Number.parseInt(cells[cells.length >= 16 ? 10 : cells.length >= 15 ? 9 : 8] || '0', 10) || 0,
-          low_stock_threshold: Number.parseInt(cells[cells.length >= 16 ? 11 : cells.length >= 15 ? 10 : 9] || '0', 10) || 0,
-          location: cells[cells.length >= 16 ? 12 : cells.length >= 15 ? 11 : 10] || '',
-          description: cells[cells.length >= 16 ? 13 : cells.length >= 15 ? 12 : 11] || '',
-          created_at: cells[cells.length >= 16 ? 14 : cells.length >= 15 ? 13 : 12] || new Date().toISOString(),
-          updated_at: cells[cells.length >= 16 ? 15 : cells.length >= 15 ? 14 : 13] || new Date().toISOString(),
+          purchase_price: Number.parseFloat(cells.length >= 17 ? cells[6] || '0' : '0') || 0,
+          purchase_url: cells[cells.length >= 17 ? 7 : 6] || '',
+          datasheet_url: cells[cells.length >= 17 ? 8 : 7] || '',
+          photo_url: cells.length >= 17 ? cells[9] || '' : cells.length >= 15 ? cells[8] || '' : '',
+          project: cells.length >= 17 ? cells[10] || '' : cells.length >= 16 ? cells[9] || '' : '',
+          quantity:
+            Number.parseInt(cells[cells.length >= 17 ? 11 : cells.length >= 16 ? 10 : cells.length >= 15 ? 9 : 8] || '0', 10) ||
+            0,
+          low_stock_threshold:
+            Number.parseInt(cells[cells.length >= 17 ? 12 : cells.length >= 16 ? 11 : cells.length >= 15 ? 10 : 9] || '0', 10) ||
+            0,
+          location: cells[cells.length >= 17 ? 13 : cells.length >= 16 ? 12 : cells.length >= 15 ? 11 : 10] || '',
+          description: cells[cells.length >= 17 ? 14 : cells.length >= 16 ? 13 : cells.length >= 15 ? 12 : 11] || '',
+          created_at:
+            cells[cells.length >= 17 ? 15 : cells.length >= 16 ? 14 : cells.length >= 15 ? 13 : 12] || new Date().toISOString(),
+          updated_at:
+            cells[cells.length >= 17 ? 16 : cells.length >= 16 ? 15 : cells.length >= 15 ? 14 : 13] || new Date().toISOString(),
         },
         index,
       );
@@ -623,6 +637,10 @@ function getStockModalTitle(mode: 'in' | 'out' | 'set') {
   return '设置库存';
 }
 
+function formatPrice(value: number) {
+  return value > 0 ? `¥${value.toFixed(2)}` : '-';
+}
+
 function isLowStock(item: Material) {
   return item.quantity > 0 && item.quantity <= item.low_stock_threshold;
 }
@@ -644,6 +662,7 @@ function toSupabaseMaterial(material: Material) {
     package: _package,
     parameters: _parameters,
     supplier: _supplier,
+    purchase_price: _purchasePrice,
     purchase_url: _purchaseUrl,
     datasheet_url: _datasheetUrl,
     photo_url: _photoUrl,
@@ -801,6 +820,7 @@ function App() {
     package: '',
     parameters: '',
     supplier: '',
+    purchase_price: 0,
     purchase_url: '',
     datasheet_url: '',
     photo_url: '',
@@ -1163,6 +1183,9 @@ function App() {
         if (previousMaterial.supplier !== nextMaterial.supplier) {
           details.push(`供应商 ${previousMaterial.supplier || '未填'} -> ${nextMaterial.supplier || '未填'}`);
         }
+        if (previousMaterial.purchase_price !== nextMaterial.purchase_price) {
+          details.push(`购买价格 ${formatPrice(previousMaterial.purchase_price)} -> ${formatPrice(nextMaterial.purchase_price)}`);
+        }
         if (previousMaterial.low_stock_threshold !== nextMaterial.low_stock_threshold) {
           details.push(`预警值 ${previousMaterial.low_stock_threshold} -> ${nextMaterial.low_stock_threshold}`);
         }
@@ -1458,6 +1481,7 @@ function App() {
       package: '',
       parameters: '',
       supplier: '',
+      purchase_price: 0,
       purchase_url: '',
       datasheet_url: '',
       photo_url: '',
@@ -1481,6 +1505,7 @@ function App() {
       package: material.package,
       parameters: material.parameters,
       supplier: material.supplier,
+      purchase_price: material.purchase_price,
       purchase_url: material.purchase_url,
       datasheet_url: material.datasheet_url,
       photo_url: material.photo_url,
@@ -1504,6 +1529,7 @@ function App() {
       package: material.package,
       parameters: material.parameters,
       supplier: material.supplier,
+      purchase_price: material.purchase_price,
       purchase_url: material.purchase_url,
       datasheet_url: material.datasheet_url,
       photo_url: material.photo_url,
@@ -2165,6 +2191,7 @@ function App() {
                     <th>分类</th>
                     <th>位置</th>
                     <th>项目</th>
+                    <th>购买价格</th>
                     <th>库存</th>
                     <th>预警</th>
                     <th>资料</th>
@@ -2232,6 +2259,7 @@ function App() {
                           </select>
                         </td>
                         <td>{material.project || '-'}</td>
+                        <td>{material.purchase_price > 0 ? formatPrice(material.purchase_price) : ''}</td>
                         <td>
                           <button className="quantity-pill" onClick={() => openStockModal(material, 'set')}>
                             {material.quantity}
@@ -2315,6 +2343,7 @@ function App() {
                       {material.package ? <p>封装：{material.package}</p> : null}
                       {material.parameters ? <p>参数：{material.parameters}</p> : null}
                       {material.supplier ? <p>供应商：{material.supplier}</p> : null}
+                      {material.purchase_price > 0 ? <p>购买价格：{formatPrice(material.purchase_price)}</p> : null}
                       <p>预警：{material.low_stock_threshold}</p>
                       <div className="meta-controls-row">
                         <label className="meta-field">
@@ -2489,6 +2518,9 @@ function App() {
                   <div><span>封装</span><strong>{detailMaterial.package || '-'}</strong></div>
                   <div><span>参数</span><strong>{detailMaterial.parameters || '-'}</strong></div>
                   <div><span>供应商</span><strong>{detailMaterial.supplier || '-'}</strong></div>
+                  {detailMaterial.purchase_price > 0 ? (
+                    <div><span>购买价格</span><strong>{formatPrice(detailMaterial.purchase_price)}</strong></div>
+                  ) : null}
                   <div><span>关联项目</span><strong>{detailMaterial.project || '-'}</strong></div>
                   <div><span>低库存预警</span><strong>{detailMaterial.low_stock_threshold}</strong></div>
                   <div><span>更新时间</span><strong>{new Date(detailMaterial.updated_at).toLocaleString()}</strong></div>
@@ -2649,6 +2681,22 @@ function App() {
                     value={formData.supplier}
                     onChange={(event) => setFormData({ ...formData, supplier: event.target.value })}
                     placeholder="例如：立创商城 / DigiKey / Mouser"
+                  />
+                </div>
+                <div className="form-group">
+                  <label>购买价格</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={formData.purchase_price}
+                    onChange={(event) =>
+                      setFormData({
+                        ...formData,
+                        purchase_price: Number.parseFloat(event.target.value) || 0,
+                      })
+                    }
+                    placeholder="0.00"
                   />
                 </div>
                 <div className="form-group">
