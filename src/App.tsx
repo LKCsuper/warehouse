@@ -199,7 +199,7 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string)
 }
 
 function getObsConfig(): ObsConfig {
-  const endpoint = localStorage.getItem(STORAGE_KEYS.obsEndpoint)?.trim().replace(/\/+$/, '') || '';
+  const endpoint = normalizeObsEndpoint(localStorage.getItem(STORAGE_KEYS.obsEndpoint) || '');
   const bucket = localStorage.getItem(STORAGE_KEYS.obsBucket)?.trim() || '';
   const objectKey = localStorage.getItem(STORAGE_KEYS.obsObjectKey)?.trim() || DEFAULT_OBS_OBJECT_KEY;
   const accessKeyId = localStorage.getItem(STORAGE_KEYS.obsAccessKeyId)?.trim() || '';
@@ -213,6 +213,12 @@ function getObsConfig(): ObsConfig {
     secretAccessKey,
     isConfigured: Boolean(endpoint && bucket && objectKey && accessKeyId && secretAccessKey),
   };
+}
+
+function normalizeObsEndpoint(value: string) {
+  const endpoint = value.trim().replace(/\/+$/, '');
+  if (!endpoint) return '';
+  return /^https?:\/\//i.test(endpoint) ? endpoint : `https://${endpoint}`;
 }
 
 function encodeObsObjectKey(objectKey: string) {
@@ -1915,7 +1921,7 @@ function App() {
   async function handleSaveCloudConfig(event: React.FormEvent) {
     event.preventDefault();
 
-    const obsEndpoint = cloudForm.obsEndpoint.trim().replace(/\/+$/, '');
+    const obsEndpoint = normalizeObsEndpoint(cloudForm.obsEndpoint);
     const obsBucket = cloudForm.obsBucket.trim();
     const obsObjectKey = cloudForm.obsObjectKey.trim() || DEFAULT_OBS_OBJECT_KEY;
     const obsAccessKeyId = cloudForm.obsAccessKeyId.trim();
@@ -1960,7 +1966,7 @@ function App() {
 
   async function handleCheckCloudConnection() {
     const obsConfig = {
-      endpoint: cloudForm.obsEndpoint.trim().replace(/\/+$/, ''),
+      endpoint: normalizeObsEndpoint(cloudForm.obsEndpoint),
       bucket: cloudForm.obsBucket.trim(),
       objectKey: cloudForm.obsObjectKey.trim() || DEFAULT_OBS_OBJECT_KEY,
       accessKeyId: cloudForm.obsAccessKeyId.trim(),
@@ -3289,10 +3295,9 @@ function App() {
                       <div className="form-group">
                         <label>OBS Endpoint</label>
                         <input
-                          type="url"
                           value={cloudForm.obsEndpoint}
                           onChange={(event) => setCloudForm({ ...cloudForm, obsEndpoint: event.target.value })}
-                          placeholder="https://obs.cn-east-3.myhuaweicloud.com"
+                          placeholder="obs.cn-north-4.myhuaweicloud.com"
                         />
                       </div>
                       <div className="form-group">
