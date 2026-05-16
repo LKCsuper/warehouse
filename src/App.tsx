@@ -1976,6 +1976,7 @@ function App() {
       setCloudMessage('OBS JSON 备份已配置');
       setIsOnline(true);
       setIsCloudModalOpen(false);
+      void syncLatestObsState();
       return;
     }
 
