@@ -96,6 +96,7 @@ const BACKUP_JSON_FILE = 'warehouse-backup.json';
 const BACKUP_XLS_FILE = 'warehouse-backup.xls';
 const DEFAULT_OBS_OBJECT_KEY = 'warehouse/warehouse-backup.json';
 const OBS_IMAGE_FOLDER = 'warehouse/images';
+const OBS_IMAGE_URL_PREFIX = 'obs://';
 const MATERIAL_IMAGE_BUCKET = 'warehouse-material-images';
 const CLOUD_INITIAL_SYNC_TIMEOUT_MS = 3500;
 const CLOUD_SYNC_TIMEOUT_MS = 5000;
@@ -316,12 +317,14 @@ async function uploadFileToObs(file: File, objectKey: string) {
     throw new Error(`OBS 图片上传失败：${response.status} ${response.statusText}`);
   }
 
-  return getSignedObsObjectUrl(config, 'GET', 7 * 24 * 60 * 60, '', objectKey);
+  return `${OBS_IMAGE_URL_PREFIX}${config.bucket}/${objectKey}`;
 }
 
 function isObsUrl(url: string) {
   const config = getObsConfig();
   if (!config.isConfigured || !url) return false;
+
+  if (url.startsWith(`${OBS_IMAGE_URL_PREFIX}${config.bucket}/`)) return true;
 
   try {
     const parsed = new URL(url);
@@ -329,6 +332,65 @@ function isObsUrl(url: string) {
   } catch {
     return false;
   }
+}
+
+function getObsObjectKeyFromUrl(url: string) {
+  const config = getObsConfig();
+  if (!config.isConfigured || !url) return null;
+
+  const obsPrefix = `${OBS_IMAGE_URL_PREFIX}${config.bucket}/`;
+  if (url.startsWith(obsPrefix)) {
+    return url.slice(obsPrefix.length);
+  }
+
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname === `${config.bucket}.${new URL(config.endpoint).hostname}`) {
+      return decodeURIComponent(parsed.pathname.replace(/^\/+/, ''));
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function useDisplayImageUrl(photoUrl: string) {
+  const [displayUrl, setDisplayUrl] = useState(photoUrl);
+
+  useEffect(() => {
+    let isMounted = true;
+    const objectKey = getObsObjectKeyFromUrl(photoUrl);
+
+    if (!objectKey) {
+      setDisplayUrl(photoUrl);
+      return () => {
+        isMounted = false;
+      };
+    }
+
+    const config = getObsConfig();
+    if (!config.isConfigured) {
+      setDisplayUrl(photoUrl);
+      return () => {
+        isMounted = false;
+      };
+    }
+
+    void getSignedObsObjectUrl(config, 'GET', 3600, '', objectKey)
+      .then((url) => {
+        if (isMounted) setDisplayUrl(url);
+      })
+      .catch(() => {
+        if (isMounted) setDisplayUrl(photoUrl);
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [photoUrl]);
+
+  return displayUrl;
 }
 
 function getImageExtensionFromContentType(contentType: string) {
@@ -987,6 +1049,19 @@ function SortableSidebarItem({
       </button>
     </li>
   );
+}
+
+function MaterialImage({
+  src,
+  alt,
+  className,
+}: {
+  src: string;
+  alt: string;
+  className?: string;
+}) {
+  const displayUrl = useDisplayImageUrl(src);
+  return <img src={displayUrl} alt={alt} className={className} />;
 }
 
 function App() {
@@ -2700,7 +2775,7 @@ function App() {
                               onClick={() => setPreviewImageUrl(material.photo_url)}
                               title="查看器件图片"
                             >
-                              <img src={material.photo_url} alt={material.name} className="material-thumb small" />
+                              <MaterialImage src={material.photo_url} alt={material.name} className="material-thumb small" />
                             </button>
                           ) : (
                             <span className="image-placeholder small">无</span>
@@ -2807,7 +2882,7 @@ function App() {
                           onClick={() => setPreviewImageUrl(material.photo_url)}
                           title="查看器件图片"
                         >
-                          <img src={material.photo_url} alt={material.name} className="material-thumb" />
+                          <MaterialImage src={material.photo_url} alt={material.name} className="material-thumb" />
                         </button>
                       ) : (
                         <span className="image-placeholder">无图</span>
@@ -2973,7 +3048,7 @@ function App() {
                 disabled={!detailMaterial.photo_url}
               >
                 {detailMaterial.photo_url ? (
-                  <img src={detailMaterial.photo_url} alt={detailMaterial.name} />
+                  <MaterialImage src={detailMaterial.photo_url} alt={detailMaterial.name} />
                 ) : (
                   <span>无图</span>
                 )}
@@ -3059,7 +3134,7 @@ function App() {
             <button type="button" className="icon-close" onClick={() => setPreviewImageUrl('')}>
               ×
             </button>
-            <img src={previewImageUrl} alt="器件图片预览" />
+            <MaterialImage src={previewImageUrl} alt="器件图片预览" />
           </div>
         </div>
       ) : null}
