@@ -245,31 +245,25 @@ async function hmacSha1Base64(secret: string, value: string) {
   return btoa(binary);
 }
 
-async function createObsHeaders(config: ObsConfig, method: 'GET' | 'PUT', contentType = '') {
-  const obsDate = new Date().toUTCString();
-  const canonicalHeaders = `x-obs-date:${obsDate}\n`;
-  const canonicalResource = `/${config.bucket}/${config.objectKey}`;
-  const stringToSign = [method, '', contentType, '', `${canonicalHeaders}${canonicalResource}`].join('\n');
-  const signature = await hmacSha1Base64(config.secretAccessKey, stringToSign);
-  const headers: Record<string, string> = {
-    Authorization: `OBS ${config.accessKeyId}:${signature}`,
-    'x-obs-date': obsDate,
-  };
-
-  if (contentType) {
-    headers['Content-Type'] = contentType;
-  }
-
-  return headers;
-}
-
 function getObsObjectUrl(config: ObsConfig) {
   return `${config.endpoint}/${encodeURIComponent(config.bucket)}/${encodeObsObjectKey(config.objectKey)}`;
 }
 
+async function getSignedObsObjectUrl(config: ObsConfig, method: 'GET' | 'PUT', expiresInSeconds = 300) {
+  const expires = Math.floor(Date.now() / 1000) + expiresInSeconds;
+  const canonicalResource = `/${config.bucket}/${config.objectKey}`;
+  const stringToSign = [method, '', '', expires.toString(), canonicalResource].join('\n');
+  const signature = await hmacSha1Base64(config.secretAccessKey, stringToSign);
+  const url = new URL(getObsObjectUrl(config));
+  url.searchParams.set('AccessKeyId', config.accessKeyId);
+  url.searchParams.set('Expires', expires.toString());
+  url.searchParams.set('Signature', signature);
+  return url.toString();
+}
+
 function getObsErrorMessage(error: unknown) {
   if (error instanceof TypeError && error.message === 'Failed to fetch') {
-    return 'OBS 连接失败：浏览器请求被拦截。请检查桶 CORS 是否允许当前网页域名、GET、PUT、Authorization、Content-Type 和 x-obs-date。';
+    return 'OBS 连接失败：浏览器请求被拦截。请检查桶 CORS 是否允许当前网页域名、GET、PUT 和 Content-Type。';
   }
 
   return error instanceof Error ? `OBS 连接失败：${error.message}` : 'OBS 连接失败，请检查配置和桶 CORS。';
@@ -280,9 +274,9 @@ async function uploadSnapshotToObs(snapshot: AppSnapshot) {
   if (!config.isConfigured) return false;
 
   const body = JSON.stringify(snapshot, null, 2);
-  const response = await fetch(getObsObjectUrl(config), {
+  const response = await fetch(await getSignedObsObjectUrl(config, 'PUT'), {
     method: 'PUT',
-    headers: await createObsHeaders(config, 'PUT', 'application/json'),
+    headers: { 'Content-Type': 'application/json' },
     body,
   });
 
@@ -297,10 +291,7 @@ async function downloadSnapshotFromObs() {
   const config = getObsConfig();
   if (!config.isConfigured) return null;
 
-  const response = await fetch(getObsObjectUrl(config), {
-    method: 'GET',
-    headers: await createObsHeaders(config, 'GET'),
-  });
+  const response = await fetch(await getSignedObsObjectUrl(config, 'GET'), { method: 'GET' });
 
   if (response.status === 404) return null;
   if (!response.ok) {
@@ -1992,10 +1983,7 @@ function App() {
       setCloudCheckMessage('正在检查 OBS JSON 备份...');
 
       try {
-        const response = await fetch(getObsObjectUrl(obsConfig), {
-          method: 'GET',
-          headers: await createObsHeaders(obsConfig, 'GET'),
-        });
+        const response = await fetch(await getSignedObsObjectUrl(obsConfig, 'GET'), { method: 'GET' });
         if (response.ok || response.status === 404) {
           setIsOnline(true);
           setCloudCheckMessage(
