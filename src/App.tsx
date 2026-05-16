@@ -58,6 +58,15 @@ interface AppSnapshot {
   operation_logs: OperationLog[];
 }
 
+interface ObsConfig {
+  endpoint: string;
+  bucket: string;
+  objectKey: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  isConfigured: boolean;
+}
+
 const IS_TAURI =
   typeof window !== 'undefined' &&
   typeof (window as Window & { __TAURI_IPC__?: unknown }).__TAURI_IPC__ !== 'undefined';
@@ -69,6 +78,11 @@ const STORAGE_KEYS = {
   projects: 'projects',
   operationLogs: 'operation_logs',
   backupDir: 'backup_dir',
+  obsEndpoint: 'obs_endpoint',
+  obsBucket: 'obs_bucket',
+  obsObjectKey: 'obs_object_key',
+  obsAccessKeyId: 'obs_access_key_id',
+  obsSecretAccessKey: 'obs_secret_access_key',
   supabaseUrl: 'supabase_url',
   supabaseKey: 'supabase_key',
   viewMode: 'view_mode',
@@ -80,6 +94,7 @@ const STORAGE_KEYS = {
 const BACKUP_FOLDER = 'backups';
 const BACKUP_JSON_FILE = 'warehouse-backup.json';
 const BACKUP_XLS_FILE = 'warehouse-backup.xls';
+const DEFAULT_OBS_OBJECT_KEY = 'warehouse/warehouse-backup.json';
 const MATERIAL_IMAGE_BUCKET = 'warehouse-material-images';
 const CLOUD_INITIAL_SYNC_TIMEOUT_MS = 3500;
 const CLOUD_SYNC_TIMEOUT_MS = 5000;
@@ -181,6 +196,104 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string)
   return Promise.race([promise, timeout]).finally(() => {
     window.clearTimeout(timeoutId);
   });
+}
+
+function getObsConfig(): ObsConfig {
+  const endpoint = localStorage.getItem(STORAGE_KEYS.obsEndpoint)?.trim().replace(/\/+$/, '') || '';
+  const bucket = localStorage.getItem(STORAGE_KEYS.obsBucket)?.trim() || '';
+  const objectKey = localStorage.getItem(STORAGE_KEYS.obsObjectKey)?.trim() || DEFAULT_OBS_OBJECT_KEY;
+  const accessKeyId = localStorage.getItem(STORAGE_KEYS.obsAccessKeyId)?.trim() || '';
+  const secretAccessKey = localStorage.getItem(STORAGE_KEYS.obsSecretAccessKey)?.trim() || '';
+
+  return {
+    endpoint,
+    bucket,
+    objectKey,
+    accessKeyId,
+    secretAccessKey,
+    isConfigured: Boolean(endpoint && bucket && objectKey && accessKeyId && secretAccessKey),
+  };
+}
+
+function encodeObsObjectKey(objectKey: string) {
+  return objectKey
+    .split('/')
+    .map((part) => encodeURIComponent(part))
+    .join('/');
+}
+
+async function hmacSha1Base64(secret: string, value: string) {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-1' },
+    false,
+    ['sign'],
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(value));
+  const bytes = new Uint8Array(signature);
+  let binary = '';
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+  return btoa(binary);
+}
+
+async function createObsHeaders(config: ObsConfig, method: 'GET' | 'PUT', contentType = '') {
+  const obsDate = new Date().toUTCString();
+  const canonicalHeaders = `x-obs-date:${obsDate}\n`;
+  const canonicalResource = `/${config.bucket}/${config.objectKey}`;
+  const stringToSign = [method, '', contentType, '', `${canonicalHeaders}${canonicalResource}`].join('\n');
+  const signature = await hmacSha1Base64(config.secretAccessKey, stringToSign);
+  const headers: Record<string, string> = {
+    Authorization: `OBS ${config.accessKeyId}:${signature}`,
+    'x-obs-date': obsDate,
+  };
+
+  if (contentType) {
+    headers['Content-Type'] = contentType;
+  }
+
+  return headers;
+}
+
+function getObsObjectUrl(config: ObsConfig) {
+  return `${config.endpoint}/${encodeURIComponent(config.bucket)}/${encodeObsObjectKey(config.objectKey)}`;
+}
+
+async function uploadSnapshotToObs(snapshot: AppSnapshot) {
+  const config = getObsConfig();
+  if (!config.isConfigured) return false;
+
+  const body = JSON.stringify(snapshot, null, 2);
+  const response = await fetch(getObsObjectUrl(config), {
+    method: 'PUT',
+    headers: await createObsHeaders(config, 'PUT', 'application/json'),
+    body,
+  });
+
+  if (!response.ok) {
+    throw new Error(`OBS 上传失败：${response.status} ${response.statusText}`);
+  }
+
+  return true;
+}
+
+async function downloadSnapshotFromObs() {
+  const config = getObsConfig();
+  if (!config.isConfigured) return null;
+
+  const response = await fetch(getObsObjectUrl(config), {
+    method: 'GET',
+    headers: await createObsHeaders(config, 'GET'),
+  });
+
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    throw new Error(`OBS 下载失败：${response.status} ${response.statusText}`);
+  }
+
+  return parseSnapshotPayload(await response.json());
 }
 
 function getSupabaseConfig() {
@@ -801,7 +914,7 @@ function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingMaterial, setEditingMaterial] = useState<Material | null>(null);
-  const [isOnline, setIsOnline] = useState(() => getSupabaseConfig().isConfigured);
+  const [isOnline, setIsOnline] = useState(() => getObsConfig().isConfigured || getSupabaseConfig().isConfigured);
   const [isLoading, setIsLoading] = useState(true);
   const [isCategoryModalOpen, setIsCategoryModalOpen] = useState(false);
   const [newCategoryName, setNewCategoryName] = useState('');
@@ -815,7 +928,11 @@ function App() {
   const [backupPath, setBackupPath] = useState('');
   const [backupDir, setBackupDir] = useState(() => localStorage.getItem(STORAGE_KEYS.backupDir) || '');
   const [cloudMessage, setCloudMessage] = useState(() =>
-    getSupabaseConfig().isConfigured ? '云端备份已配置' : '未配置云端备份',
+    getObsConfig().isConfigured
+      ? 'OBS JSON 备份已配置'
+      : getSupabaseConfig().isConfigured
+        ? 'Supabase 云端备份已配置'
+        : '未配置云端备份',
   );
   const [isCloudModalOpen, setIsCloudModalOpen] = useState(false);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
@@ -829,8 +946,17 @@ function App() {
     localStorage.getItem(STORAGE_KEYS.theme) === 'dark' ? 'dark' : 'light',
   );
   const [cloudForm, setCloudForm] = useState(() => {
-    const config = getSupabaseConfig();
-    return { url: config.url, key: config.key };
+    const supabaseConfig = getSupabaseConfig();
+    const obsConfig = getObsConfig();
+    return {
+      url: supabaseConfig.url,
+      key: supabaseConfig.key,
+      obsEndpoint: obsConfig.endpoint,
+      obsBucket: obsConfig.bucket,
+      obsObjectKey: obsConfig.objectKey,
+      obsAccessKeyId: obsConfig.accessKeyId,
+      obsSecretAccessKey: obsConfig.secretAccessKey,
+    };
   });
   const [authForm, setAuthForm] = useState({ email: '', password: '' });
   const [stockModal, setStockModal] = useState<{
@@ -897,6 +1023,41 @@ function App() {
       return false;
     } finally {
       cloudSyncInFlightRef.current = false;
+    }
+  }
+
+  async function syncLatestObsState() {
+    if (!getObsConfig().isConfigured) return false;
+
+    try {
+      const snapshot = await withTimeout(
+        downloadSnapshotFromObs(),
+        CLOUD_INITIAL_SYNC_TIMEOUT_MS,
+        'OBS JSON 备份下载超时',
+      );
+      if (!snapshot) {
+        setIsOnline(true);
+        setCloudMessage('OBS JSON 备份已配置，尚未创建远端备份');
+        return false;
+      }
+
+      const localSnapshot = readSnapshotFromLocalStorage();
+      if (
+        snapshot.materials.length > 0 &&
+        (localSnapshot.materials.length === 0 || getSnapshotTime(snapshot) > getSnapshotTime(localSnapshot))
+      ) {
+        await persistSnapshot(snapshot, true, false);
+        setBackupMessage(`已从 OBS JSON 同步 ${new Date(snapshot.saved_at).toLocaleString()}`);
+      }
+
+      setIsOnline(true);
+      setCloudMessage(`OBS JSON 备份可用 ${new Date(snapshot.saved_at).toLocaleString()}`);
+      return true;
+    } catch (error) {
+      console.error('同步 OBS JSON 备份失败:', error);
+      setIsOnline(false);
+      setCloudMessage('OBS JSON 暂不可用，已使用本地缓存');
+      return false;
     }
   }
 
@@ -1102,6 +1263,19 @@ function App() {
 
     if (syncCloud) {
       try {
+        const uploadedToObs = await uploadSnapshotToObs(snapshot);
+        if (uploadedToObs) {
+          setCloudMessage(`OBS JSON 备份已更新 ${new Date(snapshot.saved_at).toLocaleString()}`);
+          setIsOnline(true);
+          return;
+        }
+      } catch (error) {
+        console.error('自动上传 OBS JSON 备份失败:', error);
+        setIsOnline(false);
+        setCloudMessage('OBS JSON 备份失败，请检查 OBS 配置或 CORS');
+      }
+
+      try {
         await uploadCloudSnapshot(snapshot, false);
       } catch (error) {
         console.error('自动上传云端备份失败:', error);
@@ -1197,9 +1371,13 @@ function App() {
         setBackupPath('浏览器预览模式不自动写入本地文件');
       }
 
+      if (getObsConfig().isConfigured) {
+        void syncLatestObsState();
+      }
+
       const cloud = initSupabase();
       if (!cloud) {
-        setIsOnline(false);
+        setIsOnline(getObsConfig().isConfigured);
         return;
       }
 
@@ -1737,10 +1915,34 @@ function App() {
   async function handleSaveCloudConfig(event: React.FormEvent) {
     event.preventDefault();
 
+    const obsEndpoint = cloudForm.obsEndpoint.trim().replace(/\/+$/, '');
+    const obsBucket = cloudForm.obsBucket.trim();
+    const obsObjectKey = cloudForm.obsObjectKey.trim() || DEFAULT_OBS_OBJECT_KEY;
+    const obsAccessKeyId = cloudForm.obsAccessKeyId.trim();
+    const obsSecretAccessKey = cloudForm.obsSecretAccessKey.trim();
+    const hasObsConfig = Boolean(obsEndpoint || obsBucket || obsAccessKeyId || obsSecretAccessKey);
+
+    if (hasObsConfig) {
+      if (!obsEndpoint || !obsBucket || !obsObjectKey || !obsAccessKeyId || !obsSecretAccessKey) {
+        alert('请完整填写 OBS Endpoint、桶名、对象路径、Access Key ID 和 Secret Access Key。');
+        return;
+      }
+
+      localStorage.setItem(STORAGE_KEYS.obsEndpoint, obsEndpoint);
+      localStorage.setItem(STORAGE_KEYS.obsBucket, obsBucket);
+      localStorage.setItem(STORAGE_KEYS.obsObjectKey, obsObjectKey);
+      localStorage.setItem(STORAGE_KEYS.obsAccessKeyId, obsAccessKeyId);
+      localStorage.setItem(STORAGE_KEYS.obsSecretAccessKey, obsSecretAccessKey);
+      setCloudMessage('OBS JSON 备份已配置');
+      setIsOnline(true);
+      setIsCloudModalOpen(false);
+      return;
+    }
+
     const url = cloudForm.url.trim();
     const key = cloudForm.key.trim();
     if (!url || !key) {
-      alert('请填写 Supabase URL 和 anon key。');
+      alert('请填写 OBS 配置；如果继续用 Supabase，则填写 Supabase URL 和 anon key。');
       return;
     }
 
@@ -1757,6 +1959,51 @@ function App() {
   }
 
   async function handleCheckCloudConnection() {
+    const obsConfig = {
+      endpoint: cloudForm.obsEndpoint.trim().replace(/\/+$/, ''),
+      bucket: cloudForm.obsBucket.trim(),
+      objectKey: cloudForm.obsObjectKey.trim() || DEFAULT_OBS_OBJECT_KEY,
+      accessKeyId: cloudForm.obsAccessKeyId.trim(),
+      secretAccessKey: cloudForm.obsSecretAccessKey.trim(),
+      isConfigured: Boolean(
+        cloudForm.obsEndpoint.trim() &&
+          cloudForm.obsBucket.trim() &&
+          cloudForm.obsAccessKeyId.trim() &&
+          cloudForm.obsSecretAccessKey.trim(),
+      ),
+    };
+
+    if (obsConfig.isConfigured) {
+      setIsCheckingCloud(true);
+      setCloudCheckMessage('正在检查 OBS JSON 备份...');
+
+      try {
+        const response = await fetch(getObsObjectUrl(obsConfig), {
+          method: 'GET',
+          headers: await createObsHeaders(obsConfig, 'GET'),
+        });
+        if (response.ok || response.status === 404) {
+          setIsOnline(true);
+          setCloudCheckMessage(
+            response.ok
+              ? '检查通过：OBS 可访问，已找到 JSON 备份。'
+              : '检查通过：OBS 可访问，尚未创建 JSON 备份，保存后点击上传即可。',
+          );
+          return;
+        }
+        throw new Error(`${response.status} ${response.statusText}`);
+      } catch (error) {
+        console.error('检查 OBS 连接失败:', error);
+        setIsOnline(false);
+        setCloudCheckMessage(
+          error instanceof Error ? `OBS 连接失败：${error.message}` : 'OBS 连接失败，请检查配置和桶 CORS。',
+        );
+        return;
+      } finally {
+        setIsCheckingCloud(false);
+      }
+    }
+
     const url = cloudForm.url.trim();
     const key = cloudForm.key.trim();
     if (!url || !key) {
@@ -1830,10 +2077,23 @@ function App() {
     }
     localStorage.removeItem(STORAGE_KEYS.supabaseUrl);
     localStorage.removeItem(STORAGE_KEYS.supabaseKey);
+    localStorage.removeItem(STORAGE_KEYS.obsEndpoint);
+    localStorage.removeItem(STORAGE_KEYS.obsBucket);
+    localStorage.removeItem(STORAGE_KEYS.obsObjectKey);
+    localStorage.removeItem(STORAGE_KEYS.obsAccessKeyId);
+    localStorage.removeItem(STORAGE_KEYS.obsSecretAccessKey);
     supabase = null;
     supabaseClientKey = '';
     setCloudUser(null);
-    setCloudForm({ url: '', key: '' });
+    setCloudForm({
+      url: '',
+      key: '',
+      obsEndpoint: '',
+      obsBucket: '',
+      obsObjectKey: DEFAULT_OBS_OBJECT_KEY,
+      obsAccessKeyId: '',
+      obsSecretAccessKey: '',
+    });
     setCloudMessage('未配置云端备份');
     setIsOnline(false);
     setIsCloudModalOpen(false);
@@ -1890,6 +2150,21 @@ function App() {
   async function handleUploadCloudBackup() {
     const snapshot = createSnapshot(materials, categories, locations, operationLogs, projects);
 
+    if (getObsConfig().isConfigured) {
+      try {
+        await uploadSnapshotToObs(snapshot);
+        setCloudMessage(`OBS JSON 备份已上传 ${new Date(snapshot.saved_at).toLocaleString()}`);
+        setIsOnline(true);
+        alert('OBS JSON 备份已上传。');
+      } catch (error) {
+        console.error('上传 OBS JSON 备份失败:', error);
+        setIsOnline(false);
+        setCloudMessage('OBS JSON 备份上传失败，请检查 OBS 配置或 CORS');
+        alert('上传失败。请确认 OBS Endpoint、桶名、AK/SK、对象路径和桶 CORS 配置正确。');
+      }
+      return;
+    }
+
     try {
       const uploaded = await uploadCloudSnapshot(snapshot, true);
       if (uploaded) alert('云端备份已上传。');
@@ -1902,6 +2177,30 @@ function App() {
   }
 
   async function handleRestoreCloudBackup() {
+    if (getObsConfig().isConfigured) {
+      if (!confirm('从 OBS JSON 备份恢复会覆盖当前本地数据，确定继续吗？')) return;
+
+      try {
+        const snapshot = await downloadSnapshotFromObs();
+        if (!snapshot) {
+          alert('OBS 中还没有找到 JSON 备份。');
+          return;
+        }
+
+        await persistSnapshot(snapshot, true, false);
+        setSelectedCategory('全部');
+        setCloudMessage(`已从 OBS JSON 恢复 ${snapshot.materials.length} 条物料`);
+        setIsOnline(true);
+        alert(`恢复成功，共恢复 ${snapshot.materials.length} 条物料。`);
+      } catch (error) {
+        console.error('恢复 OBS JSON 备份失败:', error);
+        setIsOnline(false);
+        setCloudMessage('OBS JSON 恢复失败，请检查 OBS 配置或 CORS');
+        alert('恢复失败。请确认 OBS 中存在 warehouse-backup.json，并且桶 CORS 允许 GET。');
+      }
+      return;
+    }
+
     const cloud = initSupabase();
     if (!cloud) {
       setIsCloudModalOpen(true);
@@ -2984,37 +3283,90 @@ function App() {
                 <section className="setup-step">
                   <span>1</span>
                   <div>
-                    <strong>填写自己的 Supabase 项目</strong>
-                    <p>在 Supabase Project Settings 的 API 页面复制 Project URL 和 anon public key。</p>
+                    <strong>填写华为云 OBS JSON 备份</strong>
+                    <p>创建一个 OBS 桶，给桶配置 CORS 后，填写 Endpoint、桶名、AK/SK 和 JSON 文件路径。</p>
+                    <div className="form-grid two-columns">
+                      <div className="form-group">
+                        <label>OBS Endpoint</label>
+                        <input
+                          type="url"
+                          value={cloudForm.obsEndpoint}
+                          onChange={(event) => setCloudForm({ ...cloudForm, obsEndpoint: event.target.value })}
+                          placeholder="https://obs.cn-east-3.myhuaweicloud.com"
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>桶名 Bucket</label>
+                        <input
+                          value={cloudForm.obsBucket}
+                          onChange={(event) => setCloudForm({ ...cloudForm, obsBucket: event.target.value })}
+                          placeholder="my-warehouse-backup"
+                        />
+                      </div>
+                    </div>
                     <div className="form-group">
-                      <label>Supabase URL *</label>
+                      <label>JSON 对象路径</label>
                       <input
-                        type="url"
-                        value={cloudForm.url}
-                        onChange={(event) => setCloudForm({ ...cloudForm, url: event.target.value })}
-                        placeholder="https://xxxx.supabase.co"
-                        disabled={getSupabaseConfig().isEnvConfigured}
-                        required
+                        value={cloudForm.obsObjectKey}
+                        onChange={(event) => setCloudForm({ ...cloudForm, obsObjectKey: event.target.value })}
+                        placeholder={DEFAULT_OBS_OBJECT_KEY}
                       />
                     </div>
-                    <div className="form-group">
-                      <label>Supabase anon key *</label>
-                      <textarea
-                        value={cloudForm.key}
-                        onChange={(event) => setCloudForm({ ...cloudForm, key: event.target.value })}
-                        placeholder="粘贴项目的 anon public key"
-                        disabled={getSupabaseConfig().isEnvConfigured}
-                        required
-                      />
+                    <div className="form-grid two-columns">
+                      <div className="form-group">
+                        <label>Access Key ID</label>
+                        <input
+                          value={cloudForm.obsAccessKeyId}
+                          onChange={(event) => setCloudForm({ ...cloudForm, obsAccessKeyId: event.target.value })}
+                          placeholder="华为云 AK"
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Secret Access Key</label>
+                        <input
+                          type="password"
+                          value={cloudForm.obsSecretAccessKey}
+                          onChange={(event) => setCloudForm({ ...cloudForm, obsSecretAccessKey: event.target.value })}
+                          placeholder="华为云 SK"
+                        />
+                      </div>
                     </div>
+                    <p className="setup-hint">桶 CORS 至少允许 GET、PUT、Authorization、Content-Type、x-obs-date。</p>
                   </div>
                 </section>
 
                 <section className="setup-step">
                   <span>2</span>
                   <div>
-                    <strong>创建备份、图片存储和权限</strong>
-                    <p>把下面 SQL 粘贴到 Supabase SQL Editor 执行。备份和图片写入都限定在登录账号名下。</p>
+                    <strong>Supabase 兼容设置</strong>
+                    <p>如果还想保留旧 Supabase 方案，可以继续填写 Project URL 和 anon public key；只用 OBS 可留空。</p>
+                    <div className="form-group">
+                      <label>Supabase URL</label>
+                      <input
+                        type="url"
+                        value={cloudForm.url}
+                        onChange={(event) => setCloudForm({ ...cloudForm, url: event.target.value })}
+                        placeholder="https://xxxx.supabase.co"
+                        disabled={getSupabaseConfig().isEnvConfigured}
+                      />
+                    </div>
+                    <div className="form-group">
+                      <label>Supabase anon key</label>
+                      <textarea
+                        value={cloudForm.key}
+                        onChange={(event) => setCloudForm({ ...cloudForm, key: event.target.value })}
+                        placeholder="粘贴项目的 anon public key"
+                        disabled={getSupabaseConfig().isEnvConfigured}
+                      />
+                    </div>
+                  </div>
+                </section>
+
+                <section className="setup-step">
+                  <span>3</span>
+                  <div>
+                    <strong>旧 Supabase 建表 SQL</strong>
+                    <p>只有继续使用 Supabase 时才需要执行。OBS JSON 备份不需要数据库表。</p>
                     <div className="cloud-note">
                       <code>{CLOUD_SETUP_SQL}</code>
                     </div>
@@ -3025,19 +3377,19 @@ function App() {
                 </section>
 
                 <section className="setup-step">
-                  <span>3</span>
+                  <span>4</span>
                   <div>
                     <strong>检查连接</strong>
-                    <p>检查项目能否访问、备份表和存储权限是否正确。</p>
+                    <p>优先检查 OBS；如果 OBS 没填，则检查 Supabase。</p>
                     {cloudCheckMessage ? <div className="cloud-check-result">{cloudCheckMessage}</div> : null}
                   </div>
                 </section>
 
                 <section className="setup-step">
-                  <span>4</span>
+                  <span>5</span>
                   <div>
-                    <strong>登录并同步</strong>
-                    <p>保存配置后，注册或登录云端账号，再上传一次当前仓库备份。</p>
+                    <strong>上传当前 JSON</strong>
+                    <p>保存配置后，点击“上传云端”，当前仓库会写入 OBS 的 JSON 文件。</p>
                   </div>
                 </section>
               </div>
