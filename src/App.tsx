@@ -319,6 +319,63 @@ async function uploadFileToObs(file: File, objectKey: string) {
   return getSignedObsObjectUrl(config, 'GET', 7 * 24 * 60 * 60, '', objectKey);
 }
 
+function isObsUrl(url: string) {
+  const config = getObsConfig();
+  if (!config.isConfigured || !url) return false;
+
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname === `${config.bucket}.${new URL(config.endpoint).hostname}`;
+  } catch {
+    return false;
+  }
+}
+
+function getImageExtensionFromContentType(contentType: string) {
+  if (contentType.includes('png')) return 'png';
+  if (contentType.includes('webp')) return 'webp';
+  if (contentType.includes('gif')) return 'gif';
+  return 'jpg';
+}
+
+async function copyImageUrlToObs(photoUrl: string, materialId: number) {
+  if (!photoUrl || isObsUrl(photoUrl) || photoUrl.startsWith('blob:')) return photoUrl;
+
+  const response = await fetch(photoUrl);
+  if (!response.ok) {
+    throw new Error(`图片下载失败：${response.status} ${response.statusText}`);
+  }
+
+  const contentType = response.headers.get('content-type') || 'image/jpeg';
+  const blob = await response.blob();
+  const extension = getImageExtensionFromContentType(contentType);
+  const file = new File([blob], `${materialId}.${extension}`, { type: contentType });
+  const objectKey = `${OBS_IMAGE_FOLDER}/${materialId}/${Date.now()}.${extension}`;
+  return (await uploadFileToObs(file, objectKey)) ?? photoUrl;
+}
+
+async function copySnapshotImagesToObs(snapshot: AppSnapshot) {
+  if (!getObsConfig().isConfigured) return snapshot;
+
+  let copiedCount = 0;
+  const materialsWithObsImages = await Promise.all(
+    snapshot.materials.map(async (material) => {
+      if (!material.photo_url || isObsUrl(material.photo_url)) return material;
+
+      try {
+        const photoUrl = await copyImageUrlToObs(material.photo_url, material.id);
+        if (photoUrl !== material.photo_url) copiedCount += 1;
+        return { ...material, photo_url: photoUrl };
+      } catch (error) {
+        console.warn(`复制图片到 OBS 失败：${material.name}`, error);
+        return material;
+      }
+    }),
+  );
+
+  return copiedCount > 0 ? { ...snapshot, materials: materialsWithObsImages, saved_at: new Date().toISOString() } : snapshot;
+}
+
 async function downloadSnapshotFromObs() {
   const config = getObsConfig();
   if (!config.isConfigured) return null;
@@ -2191,14 +2248,19 @@ function App() {
 
     if (getObsConfig().isConfigured) {
       try {
-        await uploadSnapshotToObs(snapshot);
-        setCloudMessage(`OBS JSON 备份已上传 ${new Date(snapshot.saved_at).toLocaleString()}`);
+        setCloudMessage('正在上传 OBS 图片和 JSON 备份...');
+        const snapshotWithObsImages = await copySnapshotImagesToObs(snapshot);
+        await uploadSnapshotToObs(snapshotWithObsImages);
+        if (snapshotWithObsImages !== snapshot) {
+          await persistSnapshot(snapshotWithObsImages, true, false);
+        }
+        setCloudMessage(`OBS 图片和 JSON 备份已上传 ${new Date(snapshotWithObsImages.saved_at).toLocaleString()}`);
         setIsOnline(true);
-        alert('OBS JSON 备份已上传。');
+        alert('OBS 图片和 JSON 备份已上传。');
       } catch (error) {
-        console.error('上传 OBS JSON 备份失败:', error);
+        console.error('上传 OBS 图片和 JSON 备份失败:', error);
         setIsOnline(false);
-        setCloudMessage('OBS JSON 备份上传失败，请检查 OBS 配置或 CORS');
+        setCloudMessage('OBS 备份上传失败，请检查 OBS 配置或 CORS');
         alert('上传失败。请确认 OBS Endpoint、桶名、AK/SK、对象路径和桶 CORS 配置正确。');
       }
       return;
