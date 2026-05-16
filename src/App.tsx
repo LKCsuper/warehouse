@@ -13,7 +13,7 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { createClient, SupabaseClient, User } from '@supabase/supabase-js';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { open } from '@tauri-apps/api/dialog';
 import { createDir, readTextFile, writeTextFile } from '@tauri-apps/api/fs';
 import { appDataDir, join } from '@tauri-apps/api/path';
@@ -83,6 +83,7 @@ const STORAGE_KEYS = {
   obsObjectKey: 'obs_object_key',
   obsAccessKeyId: 'obs_access_key_id',
   obsSecretAccessKey: 'obs_secret_access_key',
+  legacyCloudMode: 'legacy_cloud_mode',
   supabaseUrl: 'supabase_url',
   supabaseKey: 'supabase_key',
   viewMode: 'view_mode',
@@ -100,72 +101,9 @@ const OBS_IMAGE_URL_PREFIX = 'obs://';
 const MATERIAL_IMAGE_BUCKET = 'warehouse-material-images';
 const CLOUD_INITIAL_SYNC_TIMEOUT_MS = 3500;
 const CLOUD_SYNC_TIMEOUT_MS = 5000;
-const CLOUD_POLL_INTERVAL_MS = 30000;
 const CLOUD_MAX_SYNC_FAILURES = 2;
 const ENV_SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL?.trim() || '';
 const ENV_SUPABASE_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY?.trim() || '';
-const CLOUD_SETUP_SQL = `create table if not exists warehouse_backups (
-  id uuid primary key references auth.users(id) on delete cascade,
-  user_id uuid not null references auth.users(id) on delete cascade,
-  snapshot jsonb not null,
-  updated_at timestamptz not null
-);
-
-alter table warehouse_backups enable row level security;
-
-alter publication supabase_realtime add table warehouse_backups;
-
-drop policy if exists "Users can read own backup" on warehouse_backups;
-drop policy if exists "Users can create own backup" on warehouse_backups;
-drop policy if exists "Users can update own backup" on warehouse_backups;
-
-create policy "Users can read own backup"
-on warehouse_backups for select
-using (auth.uid() = user_id);
-
-create policy "Users can create own backup"
-on warehouse_backups for insert
-with check (auth.uid() = user_id and auth.uid() = id);
-
-create policy "Users can update own backup"
-on warehouse_backups for update
-using (auth.uid() = user_id)
-with check (auth.uid() = user_id and auth.uid() = id);
-
-insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
-values (
-  'warehouse-material-images',
-  'warehouse-material-images',
-  true,
-  5242880,
-  array['image/jpeg', 'image/png', 'image/webp', 'image/gif']
-)
-on conflict (id) do update
-set public = true,
-    file_size_limit = 5242880,
-    allowed_mime_types = array['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
-
-drop policy if exists "Anyone can read material images" on storage.objects;
-drop policy if exists "Users can upload own material images" on storage.objects;
-drop policy if exists "Users can update own material images" on storage.objects;
-drop policy if exists "Users can delete own material images" on storage.objects;
-
-create policy "Anyone can read material images"
-on storage.objects for select
-using (bucket_id = 'warehouse-material-images');
-
-create policy "Users can upload own material images"
-on storage.objects for insert
-with check (bucket_id = 'warehouse-material-images' and auth.uid()::text = (storage.foldername(name))[1]);
-
-create policy "Users can update own material images"
-on storage.objects for update
-using (bucket_id = 'warehouse-material-images' and auth.uid()::text = (storage.foldername(name))[1])
-with check (bucket_id = 'warehouse-material-images' and auth.uid()::text = (storage.foldername(name))[1]);
-
-create policy "Users can delete own material images"
-on storage.objects for delete
-using (bucket_id = 'warehouse-material-images' and auth.uid()::text = (storage.foldername(name))[1]);`;
 
 const DEFAULT_CATEGORIES = ['电阻', '电容', '电感', '二极管', '三极管', '芯片', '传感器', '连接器', '晶振', '其他'];
 const DEFAULT_LOCATIONS = ['抽屉 A-1', '抽屉 A-2', '抽屉 B-1', '抽屉 B-2', '盒子 C-1', '盒子 C-2', '架子 D', '其他'];
@@ -453,6 +391,10 @@ async function downloadSnapshotFromObs() {
 }
 
 function getSupabaseConfig() {
+  if (localStorage.getItem(STORAGE_KEYS.legacyCloudMode) !== 'supabase') {
+    return { url: '', key: '', isConfigured: false, isEnvConfigured: false };
+  }
+
   const url = ENV_SUPABASE_URL || localStorage.getItem(STORAGE_KEYS.supabaseUrl)?.trim() || '';
   const key = ENV_SUPABASE_KEY || localStorage.getItem(STORAGE_KEYS.supabaseKey)?.trim() || '';
   return { url, key, isConfigured: Boolean(url && key), isEnvConfigured: Boolean(ENV_SUPABASE_URL && ENV_SUPABASE_KEY) };
@@ -1099,13 +1041,9 @@ function App() {
   const [cloudMessage, setCloudMessage] = useState(() =>
     getObsConfig().isConfigured
       ? 'OBS JSON 备份已配置'
-      : getSupabaseConfig().isConfigured
-        ? 'Supabase 云端备份已配置'
-        : '未配置云端备份',
+      : '未配置 OBS 云端备份',
   );
   const [isCloudModalOpen, setIsCloudModalOpen] = useState(false);
-  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
-  const [cloudUser, setCloudUser] = useState<User | null>(null);
   const [cloudCheckMessage, setCloudCheckMessage] = useState('');
   const [isCheckingCloud, setIsCheckingCloud] = useState(false);
   const [viewMode, setViewMode] = useState<'card' | 'table'>(() =>
@@ -1127,7 +1065,6 @@ function App() {
       obsSecretAccessKey: obsConfig.secretAccessKey,
     };
   });
-  const [authForm, setAuthForm] = useState({ email: '', password: '' });
   const [stockModal, setStockModal] = useState<{
     material: Material;
     mode: 'in' | 'out' | 'set';
@@ -1315,17 +1252,6 @@ function App() {
     return true;
   }
 
-  function scheduleCloudRefresh(sourceLabel = '云端') {
-    if (realtimeRefreshTimerRef.current !== null) {
-      window.clearTimeout(realtimeRefreshTimerRef.current);
-    }
-
-    realtimeRefreshTimerRef.current = window.setTimeout(() => {
-      realtimeRefreshTimerRef.current = null;
-      void runCloudSync(sourceLabel);
-    }, 300);
-  }
-
   function stopRealtimeSync() {
     if (realtimeRefreshTimerRef.current !== null) {
       window.clearTimeout(realtimeRefreshTimerRef.current);
@@ -1343,40 +1269,6 @@ function App() {
     realtimeChannelRef.current = null;
   }
 
-  function startRealtimeSync(userId?: string) {
-    const cloud = initSupabase();
-    if (!cloud) return;
-
-    stopRealtimeSync();
-
-    const channel = cloud
-      .channel(`warehouse-sync-${userId ?? 'public'}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'materials' }, () => {
-        scheduleCloudRefresh('其他设备');
-      });
-
-    if (userId) {
-      channel.on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'warehouse_backups', filter: `user_id=eq.${userId}` },
-        () => {
-          scheduleCloudRefresh('其他设备');
-        },
-      );
-    }
-
-    realtimeChannelRef.current = channel;
-    void channel.subscribe((status) => {
-      if (status === 'SUBSCRIBED') {
-        setIsOnline(true);
-      }
-    });
-
-    cloudPollingTimerRef.current = window.setInterval(() => {
-      void runCloudSync('云端');
-    }, CLOUD_POLL_INTERVAL_MS);
-  }
-
   async function uploadCloudSnapshot(snapshot: AppSnapshot, showAlert = false) {
     const cloud = initSupabase();
     if (!cloud) {
@@ -1386,7 +1278,7 @@ function App() {
 
     const user = await getCurrentCloudUser(cloud);
     if (!user) {
-      if (showAlert) openAuthModal();
+      if (showAlert) setIsCloudModalOpen(true);
       return false;
     }
 
@@ -1399,7 +1291,6 @@ function App() {
 
     if (error) throw error;
 
-    setCloudUser(user);
     setCloudMessage(`云端备份已更新 ${new Date(snapshot.saved_at).toLocaleString()}`);
     setIsOnline(true);
     return true;
@@ -1475,26 +1366,8 @@ function App() {
 
   useEffect(() => {
     void loadMaterials();
-    void refreshCloudUser().then((user) => {
-      if (user) startRealtimeSync(user.id);
-    });
 
-    const cloud = initSupabase();
-    const subscription = cloud?.auth.onAuthStateChange((_event, session) => {
-      setCloudUser(session?.user ?? null);
-      setCloudMessage(session?.user?.email ? `已登录：${session.user.email}` : '云端备份已配置，请登录后同步');
-      if (session?.user) {
-        startRealtimeSync(session.user.id);
-        scheduleCloudRefresh('云端');
-      } else {
-        stopRealtimeSync();
-      }
-    });
-
-    return () => {
-      stopRealtimeSync();
-      subscription?.data.subscription.unsubscribe();
-    };
+    return () => stopRealtimeSync();
   }, []);
 
   async function refreshCloudUser() {
@@ -1507,7 +1380,6 @@ function App() {
         CLOUD_INITIAL_SYNC_TIMEOUT_MS,
         '云端登录状态检查超时',
       );
-      setCloudUser(user);
       if (user?.email) {
         setCloudMessage(`已登录：${user.email}`);
       }
@@ -1550,7 +1422,9 @@ function App() {
         return;
       }
 
-      void runCloudSync('云端', CLOUD_INITIAL_SYNC_TIMEOUT_MS);
+      if (!getObsConfig().isConfigured) {
+        void runCloudSync('云端', CLOUD_INITIAL_SYNC_TIMEOUT_MS);
+      }
     } catch (error) {
       console.error('加载数据失败:', error);
       setIsOnline(false);
@@ -1670,8 +1544,7 @@ function App() {
       '云端登录状态检查超时',
     );
     if (!user) {
-      openAuthModal();
-      throw new Error('请先登录云端账号，再上传器件图片。');
+      throw new Error('旧 Supabase 图片上传需要登录账号；建议改用 OBS 云端备份。');
     }
 
     const path = `${user.id}/${materialId}/${Date.now()}.${getImageExtension(file)}`;
@@ -2022,16 +1895,6 @@ function App() {
     importInputRef.current?.click();
   }
 
-  function openAuthModal() {
-    if (!getSupabaseConfig().isConfigured) {
-      setCloudCheckMessage('请先完成云端设置：填写 Supabase URL 和 anon key，执行建表 SQL，再检查连接。');
-      setIsCloudModalOpen(true);
-      return;
-    }
-
-    setIsAuthModalOpen(true);
-  }
-
   async function handleChooseBackupDir() {
     if (!IS_TAURI) {
       alert('只有桌面版才能选择备份目录。');
@@ -2109,6 +1972,7 @@ function App() {
       localStorage.setItem(STORAGE_KEYS.obsObjectKey, obsObjectKey);
       localStorage.setItem(STORAGE_KEYS.obsAccessKeyId, obsAccessKeyId);
       localStorage.setItem(STORAGE_KEYS.obsSecretAccessKey, obsSecretAccessKey);
+      localStorage.removeItem(STORAGE_KEYS.legacyCloudMode);
       setCloudMessage('OBS JSON 备份已配置');
       setIsOnline(true);
       setIsCloudModalOpen(false);
@@ -2118,19 +1982,19 @@ function App() {
     const url = cloudForm.url.trim();
     const key = cloudForm.key.trim();
     if (!url || !key) {
-      alert('请填写 OBS 配置；如果继续用 Supabase，则填写 Supabase URL 和 anon key。');
+      alert('请填写 OBS 配置。');
       return;
     }
 
+    localStorage.setItem(STORAGE_KEYS.legacyCloudMode, 'supabase');
     localStorage.setItem(STORAGE_KEYS.supabaseUrl, url);
     localStorage.setItem(STORAGE_KEYS.supabaseKey, key);
     supabase = null;
     supabaseClientKey = '';
-    setCloudMessage('云端备份已配置，请登录后同步');
+    setCloudMessage('旧 Supabase 云端备份已配置');
     setIsOnline(true);
     setIsCloudModalOpen(false);
 
-    await refreshCloudUser();
     await loadMaterials();
   }
 
@@ -2230,24 +2094,12 @@ function App() {
     }
   }
 
-  async function handleCopyCloudSql() {
-    try {
-      await navigator.clipboard.writeText(CLOUD_SETUP_SQL);
-      setCloudCheckMessage('建表 SQL 已复制，可以粘贴到 Supabase SQL Editor 执行。');
-    } catch {
-      setCloudCheckMessage('复制失败，请手动选中 SQL 内容复制。');
-    }
-  }
-
   function handleClearCloudConfig() {
     if (!confirm('确定清除云端配置吗？本机缓存不会删除。')) return;
 
-    const cloud = supabase;
-    if (cloud) {
-      void runSerializedAuthRequest(() => cloud.auth.signOut());
-    }
     localStorage.removeItem(STORAGE_KEYS.supabaseUrl);
     localStorage.removeItem(STORAGE_KEYS.supabaseKey);
+    localStorage.removeItem(STORAGE_KEYS.legacyCloudMode);
     localStorage.removeItem(STORAGE_KEYS.obsEndpoint);
     localStorage.removeItem(STORAGE_KEYS.obsBucket);
     localStorage.removeItem(STORAGE_KEYS.obsObjectKey);
@@ -2255,7 +2107,6 @@ function App() {
     localStorage.removeItem(STORAGE_KEYS.obsSecretAccessKey);
     supabase = null;
     supabaseClientKey = '';
-    setCloudUser(null);
     setCloudForm({
       url: '',
       key: '',
@@ -2268,54 +2119,6 @@ function App() {
     setCloudMessage('未配置云端备份');
     setIsOnline(false);
     setIsCloudModalOpen(false);
-  }
-
-  async function handleCloudAuth(mode: 'sign-in' | 'sign-up') {
-    const cloud = initSupabase();
-    if (!cloud) {
-      setIsCloudModalOpen(true);
-      return;
-    }
-
-    const email = authForm.email.trim();
-    const password = authForm.password;
-    if (!email || password.length < 6) {
-      alert('请输入邮箱和至少 6 位密码。');
-      return;
-    }
-
-    try {
-      const result = await runSerializedAuthRequest(() =>
-        mode === 'sign-in'
-          ? cloud.auth.signInWithPassword({ email, password })
-          : cloud.auth.signUp({ email, password }),
-      );
-
-      if (result.error) throw result.error;
-
-      const user = result.data.user ?? (await refreshCloudUser());
-      if (user && 'email' in user) {
-        setCloudUser(user as User);
-      }
-
-      setCloudMessage(mode === 'sign-in' ? `已登录：${email}` : `账号已创建：${email}`);
-      setIsOnline(true);
-      setIsAuthModalOpen(false);
-      alert(mode === 'sign-in' ? '登录成功。' : '注册成功。如果 Supabase 开启了邮箱确认，请先查收邮件完成确认。');
-    } catch (error) {
-      console.error('云端账号操作失败:', error);
-      setIsOnline(false);
-      alert(mode === 'sign-in' ? '登录失败，请检查邮箱和密码。' : '注册失败，请检查邮箱、密码或 Supabase Auth 设置。');
-    }
-  }
-
-  async function handleSignOut() {
-    const cloud = initSupabase();
-    if (!cloud) return;
-
-    await runSerializedAuthRequest(() => cloud.auth.signOut());
-    setCloudUser(null);
-    setCloudMessage('已退出云端账号');
   }
 
   async function handleUploadCloudBackup() {
@@ -2383,9 +2186,9 @@ function App() {
       return;
     }
 
-    const user = cloudUser ?? (await refreshCloudUser());
+    const user = await refreshCloudUser();
     if (!user) {
-      openAuthModal();
+      setIsCloudModalOpen(true);
       return;
     }
 
@@ -2546,15 +2349,6 @@ function App() {
           <button className="secondary-inline" onClick={() => setIsCloudModalOpen(true)}>
             云端设置
           </button>
-          {cloudUser ? (
-            <button className="secondary-inline" onClick={() => void handleSignOut()}>
-              退出账号
-            </button>
-          ) : (
-            <button className="secondary-inline" onClick={openAuthModal}>
-              登录云端
-            </button>
-          )}
           <button className="secondary-inline" onClick={() => void handleUploadCloudBackup()}>
             上传云端
           </button>
@@ -3506,65 +3300,24 @@ function App() {
                         />
                       </div>
                     </div>
-                    <p className="setup-hint">桶 CORS 至少允许 GET、PUT、Authorization、Content-Type、x-obs-date。</p>
+                    <p className="setup-hint">桶 CORS 至少允许 GET、PUT、HEAD、Content-Type。</p>
                   </div>
                 </section>
 
                 <section className="setup-step">
                   <span>2</span>
                   <div>
-                    <strong>Supabase 兼容设置</strong>
-                    <p>如果还想保留旧 Supabase 方案，可以继续填写 Project URL 和 anon public key；只用 OBS 可留空。</p>
-                    <div className="form-group">
-                      <label>Supabase URL</label>
-                      <input
-                        type="url"
-                        value={cloudForm.url}
-                        onChange={(event) => setCloudForm({ ...cloudForm, url: event.target.value })}
-                        placeholder="https://xxxx.supabase.co"
-                        disabled={getSupabaseConfig().isEnvConfigured}
-                      />
-                    </div>
-                    <div className="form-group">
-                      <label>Supabase anon key</label>
-                      <textarea
-                        value={cloudForm.key}
-                        onChange={(event) => setCloudForm({ ...cloudForm, key: event.target.value })}
-                        placeholder="粘贴项目的 anon public key"
-                        disabled={getSupabaseConfig().isEnvConfigured}
-                      />
-                    </div>
+                    <strong>检查连接</strong>
+                    <p>检查 OBS Endpoint、桶名、AK/SK、JSON 路径和 CORS 是否可用。</p>
+                    {cloudCheckMessage ? <div className="cloud-check-result">{cloudCheckMessage}</div> : null}
                   </div>
                 </section>
 
                 <section className="setup-step">
                   <span>3</span>
                   <div>
-                    <strong>旧 Supabase 建表 SQL</strong>
-                    <p>只有继续使用 Supabase 时才需要执行。OBS JSON 备份不需要数据库表。</p>
-                    <div className="cloud-note">
-                      <code>{CLOUD_SETUP_SQL}</code>
-                    </div>
-                    <button type="button" className="secondary-inline" onClick={() => void handleCopyCloudSql()}>
-                      复制 SQL
-                    </button>
-                  </div>
-                </section>
-
-                <section className="setup-step">
-                  <span>4</span>
-                  <div>
-                    <strong>检查连接</strong>
-                    <p>优先检查 OBS；如果 OBS 没填，则检查 Supabase。</p>
-                    {cloudCheckMessage ? <div className="cloud-check-result">{cloudCheckMessage}</div> : null}
-                  </div>
-                </section>
-
-                <section className="setup-step">
-                  <span>5</span>
-                  <div>
-                    <strong>上传当前 JSON</strong>
-                    <p>保存配置后，点击“上传云端”，当前仓库会写入 OBS 的 JSON 文件。</p>
+                    <strong>上传当前备份</strong>
+                    <p>保存配置后，点击“上传云端”，当前仓库和图片会写入 OBS。</p>
                   </div>
                 </section>
               </div>
@@ -3587,62 +3340,6 @@ function App() {
                   </button>
                   <button type="submit" className="save">
                     保存配置
-                  </button>
-                </div>
-              </div>
-            </form>
-          </div>
-        </div>
-      ) : null}
-
-      {isAuthModalOpen ? (
-        <div className="modal-overlay" onClick={() => setIsAuthModalOpen(false)}>
-          <div className="modal" onClick={(event) => event.stopPropagation()}>
-            <h2>登录云端账号</h2>
-            <div className="cloud-check-result">如果还没有配置云端，请先到“云端设置”填写 Supabase 并检查连接。</div>
-            <form
-              onSubmit={(event) => {
-                event.preventDefault();
-                void handleCloudAuth('sign-in');
-              }}
-            >
-              <div className="form-group">
-                <label>邮箱 *</label>
-                <input
-                  type="email"
-                  value={authForm.email}
-                  onChange={(event) => setAuthForm({ ...authForm, email: event.target.value })}
-                  placeholder="you@example.com"
-                  required
-                />
-              </div>
-
-              <div className="form-group">
-                <label>密码 *</label>
-                <input
-                  type="password"
-                  value={authForm.password}
-                  onChange={(event) => setAuthForm({ ...authForm, password: event.target.value })}
-                  placeholder="至少 6 位"
-                  required
-                />
-              </div>
-
-              <div className="cloud-note">
-                <strong>换电脑时怎么用</strong>
-                <span>用同一个账号登录后，点击“从云端恢复”就能取回这份账号下的备份。</span>
-              </div>
-
-              <div className="modal-actions split-actions">
-                <button type="button" className="cancel" onClick={() => void handleCloudAuth('sign-up')}>
-                  注册账号
-                </button>
-                <div>
-                  <button type="button" className="cancel" onClick={() => setIsAuthModalOpen(false)}>
-                    取消
-                  </button>
-                  <button type="submit" className="save">
-                    登录
                   </button>
                 </div>
               </div>
