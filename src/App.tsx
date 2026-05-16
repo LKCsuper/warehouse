@@ -246,7 +246,13 @@ async function hmacSha1Base64(secret: string, value: string) {
 }
 
 function getObsObjectUrl(config: ObsConfig) {
-  return `${config.endpoint}/${encodeURIComponent(config.bucket)}/${encodeObsObjectKey(config.objectKey)}`;
+  const endpoint = new URL(config.endpoint);
+  const bucketHostPrefix = `${config.bucket}.`;
+  const host = endpoint.hostname.startsWith(bucketHostPrefix)
+    ? endpoint.host
+    : `${config.bucket}.${endpoint.host}`;
+
+  return `${endpoint.protocol}//${host}/${encodeObsObjectKey(config.objectKey)}`;
 }
 
 async function getSignedObsObjectUrl(config: ObsConfig, method: 'GET' | 'PUT', expiresInSeconds = 300) {
