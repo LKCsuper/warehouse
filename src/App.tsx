@@ -267,6 +267,14 @@ function getObsObjectUrl(config: ObsConfig) {
   return `${config.endpoint}/${encodeURIComponent(config.bucket)}/${encodeObsObjectKey(config.objectKey)}`;
 }
 
+function getObsErrorMessage(error: unknown) {
+  if (error instanceof TypeError && error.message === 'Failed to fetch') {
+    return 'OBS 连接失败：浏览器请求被拦截。请检查桶 CORS 是否允许当前网页域名、GET、PUT、Authorization、Content-Type 和 x-obs-date。';
+  }
+
+  return error instanceof Error ? `OBS 连接失败：${error.message}` : 'OBS 连接失败，请检查配置和桶 CORS。';
+}
+
 async function uploadSnapshotToObs(snapshot: AppSnapshot) {
   const config = getObsConfig();
   if (!config.isConfigured) return false;
@@ -2001,9 +2009,7 @@ function App() {
       } catch (error) {
         console.error('检查 OBS 连接失败:', error);
         setIsOnline(false);
-        setCloudCheckMessage(
-          error instanceof Error ? `OBS 连接失败：${error.message}` : 'OBS 连接失败，请检查配置和桶 CORS。',
-        );
+        setCloudCheckMessage(getObsErrorMessage(error));
         return;
       } finally {
         setIsCheckingCloud(false);
