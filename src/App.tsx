@@ -152,6 +152,21 @@ const DEFAULT_PROJECTS: string[] = [];
 
 let supabase: SupabaseClient | null = null;
 let supabaseClientKey = '';
+let authRequestQueue: Promise<void> = Promise.resolve();
+
+function runSerializedAuthRequest<T>(request: () => Promise<T>) {
+  const nextRequest = authRequestQueue.then(request, request);
+  authRequestQueue = nextRequest.then(
+    () => undefined,
+    () => undefined,
+  );
+  return nextRequest;
+}
+
+async function getCurrentCloudUser(cloud: SupabaseClient) {
+  const { data } = await runSerializedAuthRequest(() => cloud.auth.getUser());
+  return data.user ?? null;
+}
 
 function getSupabaseConfig() {
   const url = ENV_SUPABASE_URL || localStorage.getItem(STORAGE_KEYS.supabaseUrl)?.trim() || '';
@@ -845,8 +860,7 @@ function App() {
     }
 
     const localSnapshot = readSnapshotFromLocalStorage();
-    const { data: userData } = await cloud.auth.getUser();
-    const user = userData.user;
+    const user = await getCurrentCloudUser(cloud);
 
     if (user) {
       const { data: backupData, error: backupError } = await cloud
@@ -996,8 +1010,7 @@ function App() {
       return false;
     }
 
-    const { data } = await cloud.auth.getUser();
-    const user = data.user;
+    const user = await getCurrentCloudUser(cloud);
     if (!user) {
       if (showAlert) openAuthModal();
       return false;
@@ -1099,8 +1112,7 @@ function App() {
     const cloud = initSupabase();
     if (!cloud) return null;
 
-    const { data } = await cloud.auth.getUser();
-    const user = data.user ?? null;
+    const user = await getCurrentCloudUser(cloud);
     setCloudUser(user);
     if (user?.email) {
       setCloudMessage(`已登录：${user.email}`);
@@ -1243,8 +1255,7 @@ function App() {
       throw new Error('请先配置 Supabase 云端备份，再上传器件图片。');
     }
 
-    const { data } = await cloud.auth.getUser();
-    const user = data.user;
+    const user = await getCurrentCloudUser(cloud);
     if (!user) {
       openAuthModal();
       throw new Error('请先登录云端账号，再上传器件图片。');
@@ -1698,8 +1709,15 @@ function App() {
     setCloudCheckMessage('正在检查云端连接...');
 
     try {
-      const testClient = createClient(url, key);
-      const { data: sessionData, error: sessionError } = await testClient.auth.getSession();
+      const testClient = createClient(url, key, {
+        auth: {
+          autoRefreshToken: false,
+          detectSessionInUrl: false,
+          persistSession: false,
+          storageKey: `warehouse-connection-check-${Date.now()}`,
+        },
+      });
+      const { data: sessionData, error: sessionError } = await runSerializedAuthRequest(() => testClient.auth.getSession());
       if (sessionError) throw sessionError;
 
       const { error: tableError } = await testClient
@@ -1747,7 +1765,10 @@ function App() {
   function handleClearCloudConfig() {
     if (!confirm('确定清除云端配置吗？本机缓存不会删除。')) return;
 
-    void supabase?.auth.signOut();
+    const cloud = supabase;
+    if (cloud) {
+      void runSerializedAuthRequest(() => cloud.auth.signOut());
+    }
     localStorage.removeItem(STORAGE_KEYS.supabaseUrl);
     localStorage.removeItem(STORAGE_KEYS.supabaseKey);
     supabase = null;
@@ -1774,10 +1795,11 @@ function App() {
     }
 
     try {
-      const result =
+      const result = await runSerializedAuthRequest(() =>
         mode === 'sign-in'
-          ? await cloud.auth.signInWithPassword({ email, password })
-          : await cloud.auth.signUp({ email, password });
+          ? cloud.auth.signInWithPassword({ email, password })
+          : cloud.auth.signUp({ email, password }),
+      );
 
       if (result.error) throw result.error;
 
@@ -1801,7 +1823,7 @@ function App() {
     const cloud = initSupabase();
     if (!cloud) return;
 
-    await cloud.auth.signOut();
+    await runSerializedAuthRequest(() => cloud.auth.signOut());
     setCloudUser(null);
     setCloudMessage('已退出云端账号');
   }
