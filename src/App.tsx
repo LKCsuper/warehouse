@@ -263,8 +263,42 @@ async function createObsHeaders(config: ObsConfig, method: 'GET' | 'PUT', conten
   return headers;
 }
 
-function getObsObjectUrl(config: ObsConfig) {
-  return `${config.endpoint}/${encodeURIComponent(config.bucket)}/${encodeObsObjectKey(config.objectKey)}`;
+function getObsObjectUrl(config: ObsConfig, style: 'path' | 'virtual' = 'path') {
+  const encodedKey = encodeObsObjectKey(config.objectKey);
+  if (style === 'virtual') {
+    const endpoint = new URL(config.endpoint);
+    return `${endpoint.protocol}//${config.bucket}.${endpoint.host}/${encodedKey}`;
+  }
+
+  return `${config.endpoint}/${encodeURIComponent(config.bucket)}/${encodedKey}`;
+}
+
+function getObsObjectUrls(config: ObsConfig) {
+  return Array.from(new Set([getObsObjectUrl(config, 'path'), getObsObjectUrl(config, 'virtual')]));
+}
+
+async function fetchObsObject(
+  config: ObsConfig,
+  method: 'GET' | 'PUT',
+  contentType = '',
+  body?: BodyInit,
+) {
+  const headers = await createObsHeaders(config, method, contentType);
+  let lastResponse: Response | null = null;
+  let lastError: unknown = null;
+
+  for (const url of getObsObjectUrls(config)) {
+    try {
+      const response = await fetch(url, { method, headers, body });
+      lastResponse = response;
+      if (response.ok || (method === 'GET' && response.status === 404)) return response;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (lastResponse) return lastResponse;
+  throw lastError instanceof Error ? lastError : new Error('OBS 请求失败，请检查 Endpoint、桶名和 CORS。');
 }
 
 async function uploadSnapshotToObs(snapshot: AppSnapshot) {
@@ -272,11 +306,7 @@ async function uploadSnapshotToObs(snapshot: AppSnapshot) {
   if (!config.isConfigured) return false;
 
   const body = JSON.stringify(snapshot, null, 2);
-  const response = await fetch(getObsObjectUrl(config), {
-    method: 'PUT',
-    headers: await createObsHeaders(config, 'PUT', 'application/json'),
-    body,
-  });
+  const response = await fetchObsObject(config, 'PUT', 'application/json', body);
 
   if (!response.ok) {
     throw new Error(`OBS 上传失败：${response.status} ${response.statusText}`);
@@ -289,10 +319,7 @@ async function downloadSnapshotFromObs() {
   const config = getObsConfig();
   if (!config.isConfigured) return null;
 
-  const response = await fetch(getObsObjectUrl(config), {
-    method: 'GET',
-    headers: await createObsHeaders(config, 'GET'),
-  });
+  const response = await fetchObsObject(config, 'GET');
 
   if (response.status === 404) return null;
   if (!response.ok) {
@@ -1984,10 +2011,7 @@ function App() {
       setCloudCheckMessage('正在检查 OBS JSON 备份...');
 
       try {
-        const response = await fetch(getObsObjectUrl(obsConfig), {
-          method: 'GET',
-          headers: await createObsHeaders(obsConfig, 'GET'),
-        });
+        const response = await fetchObsObject(obsConfig, 'GET');
         if (response.ok || response.status === 404) {
           setIsOnline(true);
           setCloudCheckMessage(
@@ -1997,7 +2021,8 @@ function App() {
           );
           return;
         }
-        throw new Error(`${response.status} ${response.statusText}`);
+        const detail = await response.text().catch(() => '');
+        throw new Error(`${response.status} ${response.statusText}${detail ? `：${detail.slice(0, 120)}` : ''}`);
       } catch (error) {
         console.error('检查 OBS 连接失败:', error);
         setIsOnline(false);
