@@ -255,10 +255,15 @@ function getObsObjectUrl(config: ObsConfig) {
   return `${endpoint.protocol}//${host}/${encodeObsObjectKey(config.objectKey)}`;
 }
 
-async function getSignedObsObjectUrl(config: ObsConfig, method: 'GET' | 'PUT', expiresInSeconds = 300) {
+async function getSignedObsObjectUrl(
+  config: ObsConfig,
+  method: 'GET' | 'PUT',
+  expiresInSeconds = 300,
+  contentType = '',
+) {
   const expires = Math.floor(Date.now() / 1000) + expiresInSeconds;
   const canonicalResource = `/${config.bucket}/${config.objectKey}`;
-  const stringToSign = [method, '', '', expires.toString(), canonicalResource].join('\n');
+  const stringToSign = [method, '', contentType, expires.toString(), canonicalResource].join('\n');
   const signature = await hmacSha1Base64(config.secretAccessKey, stringToSign);
   const url = new URL(getObsObjectUrl(config));
   url.searchParams.set('AccessKeyId', config.accessKeyId);
@@ -280,9 +285,10 @@ async function uploadSnapshotToObs(snapshot: AppSnapshot) {
   if (!config.isConfigured) return false;
 
   const body = JSON.stringify(snapshot, null, 2);
-  const response = await fetch(await getSignedObsObjectUrl(config, 'PUT'), {
+  const contentType = 'application/json';
+  const response = await fetch(await getSignedObsObjectUrl(config, 'PUT', 300, contentType), {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': contentType },
     body,
   });
 
