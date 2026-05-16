@@ -95,6 +95,7 @@ const BACKUP_FOLDER = 'backups';
 const BACKUP_JSON_FILE = 'warehouse-backup.json';
 const BACKUP_XLS_FILE = 'warehouse-backup.xls';
 const DEFAULT_OBS_OBJECT_KEY = 'warehouse/warehouse-backup.json';
+const OBS_IMAGE_FOLDER = 'warehouse/images';
 const MATERIAL_IMAGE_BUCKET = 'warehouse-material-images';
 const CLOUD_INITIAL_SYNC_TIMEOUT_MS = 3500;
 const CLOUD_SYNC_TIMEOUT_MS = 5000;
@@ -245,14 +246,14 @@ async function hmacSha1Base64(secret: string, value: string) {
   return btoa(binary);
 }
 
-function getObsObjectUrl(config: ObsConfig) {
+function getObsObjectUrl(config: ObsConfig, objectKey = config.objectKey) {
   const endpoint = new URL(config.endpoint);
   const bucketHostPrefix = `${config.bucket}.`;
   const host = endpoint.hostname.startsWith(bucketHostPrefix)
     ? endpoint.host
     : `${config.bucket}.${endpoint.host}`;
 
-  return `${endpoint.protocol}//${host}/${encodeObsObjectKey(config.objectKey)}`;
+  return `${endpoint.protocol}//${host}/${encodeObsObjectKey(objectKey)}`;
 }
 
 async function getSignedObsObjectUrl(
@@ -260,12 +261,13 @@ async function getSignedObsObjectUrl(
   method: 'GET' | 'PUT',
   expiresInSeconds = 300,
   contentType = '',
+  objectKey = config.objectKey,
 ) {
   const expires = Math.floor(Date.now() / 1000) + expiresInSeconds;
-  const canonicalResource = `/${config.bucket}/${config.objectKey}`;
+  const canonicalResource = `/${config.bucket}/${objectKey}`;
   const stringToSign = [method, '', contentType, expires.toString(), canonicalResource].join('\n');
   const signature = await hmacSha1Base64(config.secretAccessKey, stringToSign);
-  const url = new URL(getObsObjectUrl(config));
+  const url = new URL(getObsObjectUrl(config, objectKey));
   url.searchParams.set('AccessKeyId', config.accessKeyId);
   url.searchParams.set('Expires', expires.toString());
   url.searchParams.set('Signature', signature);
@@ -297,6 +299,24 @@ async function uploadSnapshotToObs(snapshot: AppSnapshot) {
   }
 
   return true;
+}
+
+async function uploadFileToObs(file: File, objectKey: string) {
+  const config = getObsConfig();
+  if (!config.isConfigured) return null;
+
+  const contentType = file.type || 'application/octet-stream';
+  const response = await fetch(await getSignedObsObjectUrl(config, 'PUT', 300, contentType, objectKey), {
+    method: 'PUT',
+    headers: { 'Content-Type': contentType },
+    body: file,
+  });
+
+  if (!response.ok) {
+    throw new Error(`OBS 图片上传失败：${response.status} ${response.statusText}`);
+  }
+
+  return getSignedObsObjectUrl(config, 'GET', 7 * 24 * 60 * 60, '', objectKey);
 }
 
 async function downloadSnapshotFromObs() {
@@ -1499,10 +1519,17 @@ function App() {
   }
 
   async function uploadMaterialImage(file: File, materialId: number) {
+    const obsConfig = getObsConfig();
+    if (obsConfig.isConfigured) {
+      const objectKey = `${OBS_IMAGE_FOLDER}/${materialId}/${Date.now()}.${getImageExtension(file)}`;
+      const obsImageUrl = await uploadFileToObs(file, objectKey);
+      if (obsImageUrl) return obsImageUrl;
+    }
+
     const cloud = initSupabase();
     if (!cloud) {
       setIsCloudModalOpen(true);
-      throw new Error('请先配置 Supabase 云端备份，再上传器件图片。');
+      throw new Error('请先配置 OBS 或 Supabase 云端备份，再上传器件图片。');
     }
 
     const user = await withTimeout(
@@ -3198,7 +3225,7 @@ function App() {
                   </label>
                   <div className="image-upload-actions">
                     <strong>{imagePreviewUrl ? '器件图片已选择' : '上传一张器件照片'}</strong>
-                    <span>保存后上传到云端，支持 JPG、PNG、WebP、GIF，最大 5MB。</span>
+                    <span>保存后上传到 OBS 或云端存储，支持 JPG、PNG、WebP、GIF，最大 5MB。</span>
                     <label className="secondary-inline image-upload-trigger">
                       {imagePreviewUrl ? '更换图片' : '选择图片'}
                       <input type="file" accept="image/*" onChange={handleImageChange} />
