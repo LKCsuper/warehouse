@@ -81,6 +81,10 @@ const BACKUP_FOLDER = 'backups';
 const BACKUP_JSON_FILE = 'warehouse-backup.json';
 const BACKUP_XLS_FILE = 'warehouse-backup.xls';
 const MATERIAL_IMAGE_BUCKET = 'warehouse-material-images';
+const CLOUD_INITIAL_SYNC_TIMEOUT_MS = 3500;
+const CLOUD_SYNC_TIMEOUT_MS = 5000;
+const CLOUD_POLL_INTERVAL_MS = 30000;
+const CLOUD_MAX_SYNC_FAILURES = 2;
 const ENV_SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL?.trim() || '';
 const ENV_SUPABASE_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY?.trim() || '';
 const CLOUD_SETUP_SQL = `create table if not exists warehouse_backups (
@@ -166,6 +170,17 @@ function runSerializedAuthRequest<T>(request: () => Promise<T>) {
 async function getCurrentCloudUser(cloud: SupabaseClient) {
   const { data } = await runSerializedAuthRequest(() => cloud.auth.getUser());
   return data.user ?? null;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string) {
+  let timeoutId: number;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => {
+    window.clearTimeout(timeoutId);
+  });
 }
 
 function getSupabaseConfig() {
@@ -851,6 +866,39 @@ function App() {
   const realtimeChannelRef = useRef<ReturnType<SupabaseClient['channel']> | null>(null);
   const realtimeRefreshTimerRef = useRef<number | null>(null);
   const cloudPollingTimerRef = useRef<number | null>(null);
+  const cloudSyncInFlightRef = useRef(false);
+  const cloudSyncFailureCountRef = useRef(0);
+
+  function handleCloudSyncFailure(error: unknown, sourceLabel: string) {
+    console.error(`${sourceLabel}同步云端数据失败:`, error);
+    cloudSyncFailureCountRef.current += 1;
+    setIsOnline(false);
+    setCloudMessage('云端暂不可用，已切换为本地缓存模式');
+
+    if (cloudSyncFailureCountRef.current >= CLOUD_MAX_SYNC_FAILURES) {
+      stopRealtimeSync();
+    }
+  }
+
+  async function runCloudSync(sourceLabel = '云端', timeoutMs = CLOUD_SYNC_TIMEOUT_MS) {
+    if (cloudSyncInFlightRef.current) return false;
+
+    cloudSyncInFlightRef.current = true;
+    try {
+      const synced = await withTimeout(
+        syncLatestCloudState(sourceLabel),
+        timeoutMs,
+        '云端连接超时，已切换为本地缓存模式',
+      );
+      cloudSyncFailureCountRef.current = 0;
+      return synced;
+    } catch (error) {
+      handleCloudSyncFailure(error, sourceLabel);
+      return false;
+    } finally {
+      cloudSyncInFlightRef.current = false;
+    }
+  }
 
   async function syncLatestCloudState(sourceLabel = '云端') {
     const cloud = initSupabase();
@@ -882,7 +930,7 @@ function App() {
           return false;
         }
 
-        await persistSnapshot(cloudSnapshotWithTime);
+        await persistSnapshot(cloudSnapshotWithTime, true, false);
         const message = `已自动同步${sourceLabel}：${new Date(cloudSnapshotWithTime.saved_at).toLocaleString()}`;
         setBackupMessage(message);
         setCloudMessage(message);
@@ -929,6 +977,8 @@ function App() {
         localSnapshot.operation_logs,
         localSnapshot.projects,
       ),
+      true,
+      false,
     );
     setCloudMessage(`已自动同步${sourceLabel}物料：${new Date().toLocaleString()}`);
     setIsOnline(true);
@@ -942,11 +992,7 @@ function App() {
 
     realtimeRefreshTimerRef.current = window.setTimeout(() => {
       realtimeRefreshTimerRef.current = null;
-      void syncLatestCloudState(sourceLabel).catch((error) => {
-        console.error('实时同步云端数据失败:', error);
-        setIsOnline(false);
-        setCloudMessage('实时同步失败，请检查网络或 Supabase Realtime 配置');
-      });
+      void runCloudSync(sourceLabel);
     }, 300);
   }
 
@@ -997,10 +1043,8 @@ function App() {
     });
 
     cloudPollingTimerRef.current = window.setInterval(() => {
-      void syncLatestCloudState('云端').catch((error) => {
-        console.error('定时同步云端数据失败:', error);
-      });
-    }, 10000);
+      void runCloudSync('云端');
+    }, CLOUD_POLL_INTERVAL_MS);
   }
 
   async function uploadCloudSnapshot(snapshot: AppSnapshot, showAlert = false) {
@@ -1031,7 +1075,7 @@ function App() {
     return true;
   }
 
-  async function persistSnapshot(snapshot: AppSnapshot, syncState = true) {
+  async function persistSnapshot(snapshot: AppSnapshot, syncState = true, syncCloud = true) {
     savePreviousSnapshotIfNeeded(snapshot);
     saveSnapshotToLocalStorage(snapshot);
 
@@ -1056,12 +1100,14 @@ function App() {
       setBackupMessage('本地备份写入失败，但缓存仍已保存');
     }
 
-    try {
-      await uploadCloudSnapshot(snapshot, false);
-    } catch (error) {
-      console.error('自动上传云端备份失败:', error);
-      setIsOnline(false);
-      setCloudMessage('自动云端备份失败，请检查网络或权限');
+    if (syncCloud) {
+      try {
+        await uploadCloudSnapshot(snapshot, false);
+      } catch (error) {
+        console.error('自动上传云端备份失败:', error);
+        setIsOnline(false);
+        setCloudMessage('自动云端备份失败，请检查网络或权限');
+      }
     }
   }
 
@@ -1112,12 +1158,21 @@ function App() {
     const cloud = initSupabase();
     if (!cloud) return null;
 
-    const user = await getCurrentCloudUser(cloud);
-    setCloudUser(user);
-    if (user?.email) {
-      setCloudMessage(`已登录：${user.email}`);
+    try {
+      const user = await withTimeout(
+        getCurrentCloudUser(cloud),
+        CLOUD_INITIAL_SYNC_TIMEOUT_MS,
+        '云端登录状态检查超时',
+      );
+      setCloudUser(user);
+      if (user?.email) {
+        setCloudMessage(`已登录：${user.email}`);
+      }
+      return user;
+    } catch (error) {
+      handleCloudSyncFailure(error, '登录状态');
+      return null;
     }
-    return user;
   }
 
   async function loadMaterials() {
@@ -1148,7 +1203,7 @@ function App() {
         return;
       }
 
-      await syncLatestCloudState('云端');
+      void runCloudSync('云端', CLOUD_INITIAL_SYNC_TIMEOUT_MS);
     } catch (error) {
       console.error('加载数据失败:', error);
       setIsOnline(false);
@@ -1255,7 +1310,11 @@ function App() {
       throw new Error('请先配置 Supabase 云端备份，再上传器件图片。');
     }
 
-    const user = await getCurrentCloudUser(cloud);
+    const user = await withTimeout(
+      getCurrentCloudUser(cloud),
+      CLOUD_INITIAL_SYNC_TIMEOUT_MS,
+      '云端登录状态检查超时',
+    );
     if (!user) {
       openAuthModal();
       throw new Error('请先登录云端账号，再上传器件图片。');
